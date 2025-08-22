@@ -1,0 +1,10 @@
+# requirements_export.txt
+--extra-index-url https://download.pytorch.org/whl/cu121
+--extra-index-url https://download.pytorch.org/whl/cu130
+ultralytics
+torch
+torchvision
+torchaudio
+onnx
+onnxsim
+

@@ -1,0 +1,65 @@
+
+services:
+  rtdetr-api:
+    build:
+      context: ./inference
+      dockerfile: Dockerfile
+    image: rtdetr-api:latest
+    container_name: rtdetr-api
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"
+    gpus:
+      - device_ids: ["1"]
+        capabilities: ["gpu"]
+    ipc: host
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    environment:
+      ENGINE_PATH: /app/models/rtdetr-l.engine
+      NVIDIA_VISIBLE_DEVICES: "1"          # fallback for older runtimes
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    restart: unless-stopped
+    networks:
+      - ai-net            
+
+  vnc-instance-1:
+    image: ai-sandbox
+    container_name: vnc-instance-1
+    ports:
+      - "5901:5901"
+    gpus:
+      - device_ids: ["0"]
+        capabilities: ["gpu"]
+    environment:
+      RTDETR_API_URL: "http://rtdetr-api:8000/predict"   # <-- key line
+      NVIDIA_VISIBLE_DEVICES: "0"
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    restart: unless-stopped
+    depends_on:
+      - rtdetr-api
+    networks:
+      - ai-net
+
+  vnc-instance-2:
+    image: ai-sandbox
+    container_name: vnc-instance-2
+    ports:
+      - "5902:5901"
+    gpus:
+      - device_ids: ["0"]
+        capabilities: ["gpu"]
+    environment:
+      RTDETR_API_URL: "http://rtdetr-api:8000/predict"   # <-- key line
+      NVIDIA_VISIBLE_DEVICES: "0"
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    restart: unless-stopped
+    depends_on:
+      - rtdetr-api
+    networks:
+      - ai-net
+
+networks:
+  ai-net:
+    driver: bridge
