@@ -43,8 +43,13 @@ RUN sed -i 's|^$fontPath =.*|$fontPath = "/usr/share/fonts/X11/misc,/usr/share/f
 # Install python packages
 RUN pip3 install pywinauto opencv-python grpcio tritonclient[all] mss numpy
 
-# after existing pip installs
-RUN pip3 install --no-cache-dir requests pynvml
+# APT OCR deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tesseract-ocr tesseract-ocr-eng \
+    && rm -rf /var/lib/apt/lists/*
+
+# Python libs used by the task runner
+RUN pip3 install --no-cache-dir pyyaml pytesseract rapidfuzz requests pynvml
 
 COPY src /scripts
 

@@ -1,137 +1,695 @@
-import os
-import cv2
-import json
-import time
-import mss
-import numpy as np
-import subprocess
+# scripts/agent.py
+import os, re, time, json, threading, subprocess, io, uuid, shutil, traceback
+from typing import Any, Dict, List, Optional, Tuple, Union
+from datetime import datetime
+
 import requests
-from typing import List, Dict, Any, Optional, Tuple
+import yaml
+import mss
+import cv2
+import numpy as np
+import pytesseract
+from rapidfuzz import fuzz, process as fuzz_process
 
+# -----------------------
+# Config
+# -----------------------
 API_URL = os.environ.get("RTDETR_API_URL", "http://rtdetr-api:8000/predict")
-CONF_THRESH = float(os.environ.get("CONF_THRESH", "0.50"))
-MIN_BOX_AREA = int(os.environ.get("MIN_BOX_AREA", "800"))  # ignore tiny detections
+AGENT_NAME = os.environ.get("AGENT_NAME", "agent-1")
+TASK_FILE = os.environ.get("AGENT_TASK", f"/tasks/{AGENT_NAME}.yaml")
 CLICK_ENABLED = os.environ.get("CLICK_ENABLED", "1") == "1"
-SAVE_DEBUG = os.environ.get("SAVE_DEBUG", "0") == "1"
-SLEEP_BETWEEN_LOOPS = float(os.environ.get("LOOP_SLEEP", "0.25"))  # seconds
+SCREEN_INDEX = int(os.environ.get("AGENT_SCREEN_INDEX", "1"))  # mss monitor index
+DEBUG_ENABLED = os.environ.get("AGENT_DEBUG", "1") == "1"
+DEBUG_DIR = os.environ.get("AGENT_DEBUG_DIR", "/tmp/agent-debug")
 
-def capture_screen() -> np.ndarray:
-    """Capture the primary monitor of the VNC display (:1). Returns RGB image."""
-    with mss.mss() as sct:
-        monitor = sct.monitors[1]  # primary display
-        img = np.array(sct.grab(monitor))  # RGBA
-        img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)  # to BGR
-        return img
+# Optional LLM (OpenAI-compatible or local): set LLM_API_URL + LLM_MODEL + LLM_API_KEY
+LLM_API_URL = os.environ.get("LLM_API_URL", "")
+LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 
-def encode_jpeg_bgr(image_bgr: np.ndarray) -> bytes:
-    """Encode to JPEG; keep full resolution to preserve coordinate space."""
-    ok, buf = cv2.imencode(".jpg", image_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+# -----------------------
+# Utilities
+# -----------------------
+def now_utc_iso() -> str:
+    return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+def ensure_dir(p: str):
+    os.makedirs(p, exist_ok=True)
+
+def safe_json_dumps(obj: Any) -> str:
+    try:
+        return json.dumps(obj, ensure_ascii=False, default=str)
+    except Exception:
+        return json.dumps(str(obj))
+
+def which(cmd: str) -> Optional[str]:
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        fp = os.path.join(d, cmd)
+        if os.path.isfile(fp) and os.access(fp, os.X_OK):
+            return fp
+    return None
+
+# -----------------------
+# Screen capture
+# -----------------------
+class ScreenGrabber:
+    """
+    Wrap mss with cached monitor geometry so we can map image-space -> absolute desktop coords.
+    """
+    def __init__(self, screen_index: int = 1):
+        self.screen_index = screen_index
+        self.last_mon: Optional[Dict[str, int]] = None
+        self._mss = mss.mss()
+
+    def capture(self) -> Tuple[np.ndarray, Dict[str, int]]:
+        mon = self._mss.monitors[self.screen_index]
+        self.last_mon = mon
+        # BGRA -> BGR
+        raw = np.array(self._mss.grab(mon))
+        img = cv2.cvtColor(raw, cv2.COLOR_BGRA2BGR)
+        return img, mon
+
+    def to_abs(self, x_rel: int, y_rel: int) -> Tuple[int, int]:
+        """
+        Convert image (monitor-relative) coords -> absolute desktop coords
+        """
+        if not self.last_mon:
+            raise RuntimeError("Screen geometry not captured yet.")
+        return int(self.last_mon["left"] + x_rel), int(self.last_mon["top"] + y_rel)
+
+# -----------------------
+# OCR
+# -----------------------
+def ocr_image(image_bgr: np.ndarray) -> List[Dict[str, Any]]:
+    """Return OCR words with boxes: [{'text': str, 'box':[x1,y1,x2,y2], 'conf': float}]"""
+    rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    data = pytesseract.image_to_data(rgb, output_type=pytesseract.Output.DICT)
+    out = []
+    for i in range(len(data["text"])):
+        txt = (data["text"][i] or "").strip()
+        if not txt:
+            continue
+        conf = float(data["conf"][i]) if data["conf"][i] != "-1" else 0.0
+        if conf < 50:  # basic quality gate
+            continue
+        x, y, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
+        out.append({"text": txt, "box": [x, y, x + w, y + h], "conf": conf})
+    return out
+
+def _score_boldish_height(box: List[int]) -> int:
+    return box[3] - box[1]
+
+def find_text_box(
+    ocr_items: List[Dict[str, Any]],
+    regex: Optional[str] = None,
+    any_regex: Optional[List[str]] = None,
+    fuzzy_text: Optional[str] = None,
+    fuzzy_threshold: Optional[float] = None,
+    prefer_bold: bool = False,
+    nth: int = 0,
+) -> Optional[Dict[str, Any]]:
+    """
+    Find a word box by regex or fuzzy text.
+    - regex / any_regex: case-insensitive compiled patterns
+    - fuzzy_text + fuzzy_threshold (0..100): RapidFuzz partial_ratio scoring
+    """
+    patterns = []
+    if regex:
+        patterns.append(re.compile(regex, re.I))
+    if any_regex:
+        patterns += [re.compile(r, re.I) for r in any_regex]
+
+    candidates: List[Tuple[float, Dict[str, Any]]] = []
+
+    for w in ocr_items:
+        s = w["text"]
+        match_score = None
+
+        if patterns:
+            ok = any(p.search(s) for p in patterns)
+            if ok:
+                match_score = 100.0
+        elif fuzzy_text:
+            # partial_ratio works well for UI snippets
+            score = fuzz.partial_ratio(fuzzy_text, s)
+            if fuzzy_threshold is None or score >= float(fuzzy_threshold):
+                match_score = float(score)
+
+        if match_score is None:
+            continue
+
+        bonus = _score_boldish_height(w["box"]) if prefer_bold else 0
+        candidates.append((match_score + bonus, w))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda x: -x[0])
+    idx = min(nth, len(candidates) - 1)
+    return candidates[idx][1]
+
+# -----------------------
+# RT-DETR client with retries
+# -----------------------
+def encode_jpeg_bgr(image_bgr: np.ndarray, q: int = 85) -> bytes:
+    ok, buf = cv2.imencode(".jpg", image_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), q])
     if not ok:
         raise RuntimeError("cv2.imencode failed")
     return buf.tobytes()
 
-def call_rtdetr_api(session: requests.Session, image_bgr: np.ndarray, timeout: Tuple[float, float]=(1.5, 3.0)) -> List[Dict[str, Any]]:
-    """
-    POST screenshot to the FastAPI server. Returns list of detections:
-      [{"box":[x1,y1,x2,y2],"score":float,"label":int}, ...]
-    """
+def rtdetr_detect(session: requests.Session, image_bgr: np.ndarray, timeout=(3.0, 6.0), retries: int = 2) -> List[Dict[str, Any]]:
     jpg = encode_jpeg_bgr(image_bgr)
-    files = {"file": ("screen.jpg", jpg, "image/jpeg")}
-    r = session.post(API_URL, files=files, timeout=timeout)
-    r.raise_for_status()
-    data = r.json()
-    return data.get("detections", [])
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            r = session.post(API_URL, files={"file": ("screen.jpg", jpg, "image/jpeg")}, timeout=timeout)
+            r.raise_for_status()
+            return r.json().get("detections", [])
+        except Exception as e:
+            last_err = e
+            time.sleep(0.25 * (attempt + 1))
+    raise RuntimeError(f"RT-DETR request failed after {retries+1} attempts: {last_err}")
 
-def choose_box(dets: List[Dict[str, Any]], conf_thresh: float, min_area: int) -> Optional[Dict[str, Any]]:
-    """Pick the highest-confidence box that passes basic filters."""
-    best = None
-    best_score = -1.0
-    for d in dets:
-        score = float(d.get("score", 0.0))
-        if score < conf_thresh:
-            continue
-        x1, y1, x2, y2 = map(float, d.get("box", [0, 0, 0, 0]))
-        area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
-        if area < min_area:
-            continue
-        if score > best_score:
-            best = d
-            best_score = score
-    return best
+# -----------------------
+# Input helpers (typing/clicking)
+# -----------------------
+def _have_xdotool() -> bool:
+    return which("xdotool") is not None
 
-def perform_click(box: Dict[str, Any]) -> Tuple[int, int]:
-    x1, y1, x2, y2 = box["box"]
-    cx = int((x1 + x2) / 2.0)
-    cy = int((y1 + y2) / 2.0)
-    # Move + click (sync to reduce race conditions)
-    subprocess.run(["xdotool", "mousemove", "--sync", str(cx), str(cy)], check=False)
-    subprocess.run(["xdotool", "click", "1"], check=False)
-    return cx, cy
-
-def draw_debug(image_bgr: np.ndarray, box: Dict[str, Any]) -> np.ndarray:
-    x1, y1, x2, y2 = map(int, box["box"])
-    out = image_bgr.copy()
-    cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 0), 2)
-    txt = f"id={box.get('label')} conf={box.get('score'):.2f}"
-    cv2.putText(out, txt, (x1, max(0, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1, cv2.LINE_AA)
-    return out
-
-def main():
-    # Optional: launch Firefox for a simple manual test page
-    subprocess.Popen(["firefox-esr", "--no-sandbox"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(2.0)
-
-    # HTTP keep-alive for lower latency
-    session = requests.Session()
-    adapter = requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=8, max_retries=2)
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-
-    print(f"[agent] Using API_URL={API_URL}")
-    lat_hist: List[float] = []
-
+def _safe_run(cmd: List[str]) -> None:
     try:
-        while True:
-            t0 = time.perf_counter()
-            img = capture_screen()
-            t1 = time.perf_counter()
+        subprocess.run(cmd, check=False)
+    except Exception:
+        pass
+
+def type_text(text: str):
+    # Use xdotool type; for multiline, split to be safe
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        _safe_run(["xdotool", "type", "--clearmodifiers", line])
+        # Only add Return for explicit \n lines; do not append one at the end if the user didn't include it
+        if i < len(lines) - 1:
+            _safe_run(["xdotool", "key", "Return"])
+
+def send_keys(keys: List[str]):
+    for k in keys:
+        _safe_run(["xdotool", "key", k])
+
+def open_url(url: str):
+    # Prefer xdg-open fallback if firefox-esr not present
+    if which("firefox-esr"):
+        subprocess.Popen(["firefox-esr", "--new-window", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    elif which("xdg-open"):
+        subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        # Last resort: try firefox
+        subprocess.Popen(["firefox", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+# -----------------------
+# LLM optional
+# -----------------------
+def run_llm(system: str, prompt: str) -> str:
+    if not LLM_API_URL:
+        return "[LLM disabled] " + prompt[:300]
+    headers = {"Content-Type": "application/json"}
+    if LLM_API_KEY:
+        headers["Authorization"] = f"Bearer {LLM_API_KEY}"
+    body = {
+        "model": LLM_MODEL,
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+        "temperature": 0.2,
+    }
+    try:
+        r = requests.post(LLM_API_URL, headers=headers, json=body, timeout=(5, 60))
+        r.raise_for_status()
+        j = r.json()
+        # OpenAI-compatible
+        return j["choices"][0]["message"]["content"]
+    except Exception as e:
+        return f"[LLM error: {e}] {prompt[:300]}"
+
+def sub_env(s: str, ctx: Dict[str, Any]) -> str:
+    # ${VAR} from env or ctx
+    def repl(m):
+        key = m.group(1)
+        return str(os.environ.get(key, ctx.get(key, "")))
+    return re.sub(r"\$\{([^}]+)\}", repl, s)
+
+# -----------------------
+# Task Runner
+# -----------------------
+class TaskRunner:
+    def __init__(self, task_path: str):
+        self.task_path = task_path
+        self.session = requests.Session()
+        self.ctx: Dict[str, Any] = {"series": {}}
+        self._last_mtime = 0
+        self.task = None
+
+        # Screen / cache
+        self.grabber = ScreenGrabber(screen_index=SCREEN_INDEX)
+        self.last_img: Optional[np.ndarray] = None
+        self.last_ocr: Optional[List[Dict[str, Any]]] = None
+        self.last_dets: Optional[List[Dict[str, Any]]] = None
+
+        # Debug / run folder
+        self.debug_enabled = DEBUG_ENABLED
+        self.run_id = datetime.utcnow().strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:8]
+        self.run_dir = os.path.join(DEBUG_DIR, f"{AGENT_NAME}-{self.run_id}")
+        if self.debug_enabled:
+            ensure_dir(self.run_dir)
+        self.log_path = os.path.join(self.run_dir, "steps.jsonl") if self.debug_enabled else None
+        self.summary_path = os.path.join(self.run_dir, "summary.json") if self.debug_enabled else None
+
+        self._xdotool_ok = _have_xdotool()
+        self._log(
+            level="info",
+            msg="agent.start",
+            extra={"agent": AGENT_NAME, "task_file": self.task_path, "api_url": API_URL, "click_enabled": CLICK_ENABLED,
+                   "screen_index": SCREEN_INDEX, "xdotool": self._xdotool_ok, "debug_dir": self.run_dir},
+        )
+
+    # ------------- Debug logging -------------
+    def _log(self, level: str, msg: str, extra: Optional[Dict[str, Any]] = None):
+        rec = {"ts": now_utc_iso(), "level": level, "msg": msg}
+        if extra:
+            rec.update(extra)
+        line = safe_json_dumps(rec)
+        print(line, flush=True)  # console
+        if self.log_path:
+            with open(self.log_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+
+    def _save_summary(self):
+        if not self.summary_path:
+            return
+        summary = {
+            "agent": AGENT_NAME,
+            "run_id": self.run_id,
+            "task": self.task,
+            "ctx_keys": list(self.ctx.keys()),
+            "debug_dir": self.run_dir,
+        }
+        with open(self.summary_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2)
+
+    # ------------- Screen capture / cache -------------
+    def _capture(self, force: bool = False) -> np.ndarray:
+        # If we already have a frame for this step, reuse unless force
+        if force or self.last_img is None:
+            img, _mon = self.grabber.capture()
+            self.last_img = img
+            self.last_ocr = None
+            self.last_dets = None
+            if self.debug_enabled:
+                raw_path = os.path.join(self.run_dir, f"{int(time.time()*1000)}_raw.jpg")
+                cv2.imwrite(raw_path, img)
+                self._log("debug", "screenshot.captured", {"path": raw_path, "w": int(img.shape[1]), "h": int(img.shape[0])})
+        return self.last_img
+
+    # ------------- Annotate helpers -------------
+    def _annotate_and_save(self, img: np.ndarray, save_name: str, with_ocr: bool = True, with_dets: bool = True):
+        if not self.debug_enabled:
+            return
+        canvas = img.copy()
+        if with_dets and self.last_dets:
+            for d in self.last_dets:
+                x1, y1, x2, y2 = map(int, d["box"])
+                cv2.rectangle(canvas, (x1, y1), (x2, y2), (0, 165, 255), 2)  # orange
+                label = f'id={d.get("label","?")} s={d.get("score",0):.2f}'
+                cv2.putText(canvas, label, (x1, max(12, y1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 165, 255), 1, cv2.LINE_AA)
+        if with_ocr and self.last_ocr:
+            for w in self.last_ocr:
+                x1, y1, x2, y2 = map(int, w["box"])
+                cv2.rectangle(canvas, (x1, y1), (x2, y2), (0, 200, 0), 1)  # green
+                cv2.putText(canvas, w["text"], (x1, y2 + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 200, 0), 1, cv2.LINE_AA)
+        out = os.path.join(self.run_dir, save_name)
+        cv2.imwrite(out, canvas)
+        self._log("debug", "overlay.saved", {"path": out})
+
+    # ------------- OCR / DET wrappers -------------
+    def _do_ocr(self) -> List[Dict[str, Any]]:
+        if self.last_ocr is None:
+            img = self._capture()
+            self.last_ocr = ocr_image(img)
+            self._log("debug", "ocr.done", {"n": len(self.last_ocr)})
+        return self.last_ocr
+
+    def _do_detect(self, save_overlay: bool = False) -> List[Dict[str, Any]]:
+        if self.last_dets is None:
+            img = self._capture()
+            try:
+                self.last_dets = rtdetr_detect(self.session, img)
+            except Exception as e:
+                self._log("error", "detect.error", {"error": str(e)})
+                self.last_dets = []
+            self.ctx["detections"] = self.last_dets
+            self._log("debug", "detect.done", {"n": len(self.last_dets)})
+        if save_overlay:
+            self._annotate_and_save(self.last_img, f"{int(time.time()*1000)}_overlay.jpg", with_ocr=True, with_dets=True)
+        return self.last_dets
+
+    # ------------- Click helpers -------------
+    def _click_abs(self, x_abs: int, y_abs: int):
+        if not CLICK_ENABLED:
+            self._log("info", "click.skipped", {"x": x_abs, "y": y_abs, "reason": "CLICK_ENABLED=0"})
+            return
+        if not self._xdotool_ok:
+            self._log("warn", "click.skipped", {"x": x_abs, "y": y_abs, "reason": "xdotool missing"})
+            return
+        _safe_run(["xdotool", "mousemove", "--sync", str(x_abs), str(y_abs)])
+        _safe_run(["xdotool", "click", "1"])
+        self._log("info", "click.done", {"x": x_abs, "y": y_abs})
+
+    def _click_box_image_space(self, box: List[float]):
+        x1, y1, x2, y2 = map(int, box)
+        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+        x_abs, y_abs = self.grabber.to_abs(cx, cy)
+        self._click_abs(x_abs, y_abs)
+
+    # ------------- Legacy helpers (kept/backcompat) -------------
+    def _set_var(self, name, value):
+        self.ctx[name] = value
+
+    def _track_series(self, key: str, value: Any, window: int = 3):
+        s = self.ctx["series"].setdefault(key, [])
+        try:
+            v = float(value)
+        except:
+            return
+        s.append(v)
+        if len(s) > window:
+            del s[0]
+
+    def _open_student_profile(self, name: str):
+        # Heuristic: search, click matching name via OCR
+        self._click_text(regex=name)
+
+    # ------------- OCR interactions -------------
+    def _wait_text(self, regex=None, any_regex=None, fuzzy_text=None, fuzzy_threshold=None, timeout_s=30):
+        t0 = time.time()
+        while time.time() - t0 <= timeout_s:
+            self._capture(force=True)
+            ocr = self._do_ocr()
+            w = find_text_box(
+                ocr, regex=regex, any_regex=any_regex,
+                fuzzy_text=fuzzy_text, fuzzy_threshold=fuzzy_threshold
+            )
+            if w:
+                self._log("info", "wait_text.found", {"text": w["text"], "box": w["box"]})
+                return True
+            time.sleep(0.5)
+        self._log("warn", "wait_text.timeout", {"timeout_s": timeout_s, "regex": regex, "any_regex": any_regex, "fuzzy_text": fuzzy_text})
+        return False
+
+    def _click_text(self, regex=None, any_regex=None, nth=0, prefer_bold=False, fuzzy_text=None, fuzzy_threshold=None):
+        self._capture(force=True)
+        ocr = self._do_ocr()
+        w = find_text_box(
+            ocr,
+            regex=regex, any_regex=any_regex,
+            fuzzy_text=fuzzy_text, fuzzy_threshold=fuzzy_threshold,
+            prefer_bold=prefer_bold, nth=nth
+        )
+        if not w:
+            self._log("warn", "click_text.not_found", {"regex": regex, "any_regex": any_regex, "fuzzy_text": fuzzy_text})
+            return False
+        self._click_box_image_space(w["box"])
+        return True
+
+    # ------------- Detection interactions -------------
+    def _wait_detection(self, labels: Optional[List[int]], min_score: float = 0.5, timeout_s: float = 30.0) -> bool:
+        t0 = time.time()
+        labels_set = set(labels) if labels else None
+        while time.time() - t0 <= timeout_s:
+            self._capture(force=True)
+            dets = self._do_detect(save_overlay=False)
+            filtered = [d for d in dets if d.get("score", 0) >= min_score and (labels_set is None or int(d.get("label", -1)) in labels_set)]
+            if filtered:
+                self._log("info", "wait_detection.found", {"count": len(filtered), "labels": list(labels_set) if labels_set else "any"})
+                return True
+            time.sleep(0.4)
+        self._log("warn", "wait_detection.timeout", {"timeout_s": timeout_s, "labels": labels})
+        return False
+
+    def _pick_detection(
+        self,
+        labels: Optional[List[int]] = None,
+        min_score: float = 0.5,
+        nth: int = 0,
+        nearest_to_text: Optional[str] = None,
+        fuzzy_threshold: float = 70.0
+    ) -> Optional[Dict[str, Any]]:
+        dets = self._do_detect(save_overlay=False)
+        if labels:
+            dets = [d for d in dets if int(d.get("label", -1)) in set(labels)]
+        dets = [d for d in dets if d.get("score", 0) >= min_score]
+        if not dets:
+            return None
+
+        if nearest_to_text:
+            # Compute distances from each detection center to the best fuzzy-matched OCR word
+            ocr = self._do_ocr()
+            if ocr:
+                # best fuzzy target
+                scored = [(fuzz.partial_ratio(nearest_to_text, w["text"]), w) for w in ocr]
+                scored.sort(key=lambda x: -x[0])
+                if scored and scored[0][0] >= fuzzy_threshold:
+                    target_w = scored[0][1]
+                    tx = (target_w["box"][0] + target_w["box"][2]) / 2.0
+                    ty = (target_w["box"][1] + target_w["box"][3]) / 2.0
+                    dets.sort(key=lambda d: (( ( (d["box"][0]+d["box"][2])/2.0 - tx ) ** 2 + ( (d["box"][1]+d["box"][3])/2.0 - ty ) ** 2 )))
+                else:
+                    # fallback to score sort if no good fuzzy target found
+                    dets.sort(key=lambda d: -float(d.get("score", 0)))
+            else:
+                dets.sort(key=lambda d: -float(d.get("score", 0)))
+        else:
+            dets.sort(key=lambda d: -float(d.get("score", 0)))
+
+        if nth >= len(dets):
+            return None
+        return dets[nth]
+
+    def _click_detection(self, labels: Optional[List[int]], min_score: float = 0.5, nth: int = 0,
+                         nearest_to_text: Optional[str] = None):
+        self._capture(force=True)
+        det = self._pick_detection(labels=labels, min_score=min_score, nth=nth, nearest_to_text=nearest_to_text)
+        if not det:
+            self._log("warn", "click_detection.not_found", {"labels": labels, "min_score": min_score})
+            return False
+        self._click_box_image_space(det["box"])
+        return True
+
+    # ------------- Misc helpers -------------
+    def _screenshot_save(self, overlay: bool = False, note: Optional[str] = None):
+        img = self._capture(force=True)
+        ts = int(time.time() * 1000)
+        base = f"{ts}"
+        if note:
+            base += f"_{re.sub(r'[^a-zA-Z0-9_.-]+','-', note)[:40]}"
+        raw_path = os.path.join(self.run_dir, base + "_raw.jpg")
+        cv2.imwrite(raw_path, img)
+        info = {"raw": raw_path}
+        if overlay:
+            self._do_ocr()
+            self._do_detect()
+            self._annotate_and_save(img, base + "_overlay.jpg", with_ocr=True, with_dets=True)
+            info["overlay"] = os.path.join(self.run_dir, base + "_overlay.jpg")
+        self._log("info", "screenshot.saved", info)
+
+    # ------------- Task loading -------------
+    def _load_if_changed(self):
+        try:
+            st = os.stat(self.task_path)
+            if st.st_mtime != self._last_mtime or self.task is None:
+                with open(self.task_path, "r", encoding="utf-8") as f:
+                    self.task = yaml.safe_load(f) or {}
+                self._last_mtime = st.st_mtime
+                self._log("info", "task.loaded", {"path": self.task_path})
+        except FileNotFoundError:
+            pass
+
+    # ------------- Steps engine -------------
+    def _do_steps(self, steps: List[Dict[str, Any]]):
+        for idx, step in enumerate(steps):
+            if not isinstance(step, dict):
+                continue
+            (op, args), = step.items()
+            start_ts = time.time()
+            ok = True
+            err: Optional[str] = None
+
+            # Normalize args
+            _args = args
+            if isinstance(_args, str):
+                _args = {"value": _args}
+            _args = _args or {}
 
             try:
-                dets = call_rtdetr_api(session, img)
-            except Exception as e:
-                print(f"[agent] API error: {e}")
-                time.sleep(SLEEP_BETWEEN_LOOPS)
-                continue
+                # --- Ops ---
+                if op == "open_url":
+                    url = _args.get("url") or _args.get("") or _args.get("value")
+                    open_url(url)
 
-            t2 = time.perf_counter()
+                elif op == "wait_text":
+                    self._wait_text(regex=_args.get("regex"), any_regex=_args.get("any_regex"),
+                                    fuzzy_text=_args.get("fuzzy_text"), fuzzy_threshold=_args.get("fuzzy_threshold"),
+                                    timeout_s=float(_args.get("timeout_s", 30)))
 
-            chosen = choose_box(dets, CONF_THRESH, MIN_BOX_AREA)
-            if chosen:
-                if CLICK_ENABLED:
-                    cx, cy = perform_click(chosen)
-                    print(f"[agent] Clicked at ({cx},{cy})")
+                elif op == "click_text":
+                    self._click_text(regex=_args.get("regex"), any_regex=_args.get("any_regex"),
+                                     nth=int(_args.get("nth", 0)), prefer_bold=bool(_args.get("prefer_bold", False)),
+                                     fuzzy_text=_args.get("fuzzy_text"), fuzzy_threshold=_args.get("fuzzy_threshold"))
+
+                elif op == "type_text":
+                    s = sub_env(str(_args), self.ctx) if isinstance(args, str) else sub_env(_args.get("", "") or _args.get("text", ""), self.ctx)
+                    type_text(s)
+
+                elif op == "key_seq":
+                    seq = _args if isinstance(_args, list) else _args.get("", []) or _args.get("keys", [])
+                    send_keys(seq)
+
+                elif op in ("sleep", "wait"):
+                    time.sleep(float(_args.get("seconds", _args.get("", 1.0))))
+
+                elif op == "detect":
+                    save_overlay = bool(_args.get("save_overlay", False))
+                    self._do_detect(save_overlay=save_overlay)
+
+                elif op == "wait_detection":
+                    labels = _args.get("labels")
+                    if labels is None and "label" in _args:
+                        labels = [_args.get("label")]
+                    min_score = float(_args.get("min_score", 0.5))
+                    timeout_s = float(_args.get("timeout_s", 30))
+                    self._wait_detection(labels=labels, min_score=min_score, timeout_s=timeout_s)
+
+                elif op == "click_detection":
+                    labels = _args.get("labels")
+                    if labels is None and "label" in _args:
+                        labels = [_args.get("label")]
+                    min_score = float(_args.get("min_score", 0.5))
+                    nth = int(_args.get("nth", 0))
+                    nearest_to_text = _args.get("nearest_to_text")
+                    self._click_detection(labels=labels, min_score=min_score, nth=nth, nearest_to_text=nearest_to_text)
+
+                elif op == "ocr_extract":
+                    save_as = _args.get("save_as", "text_blob")
+                    self._capture(force=True)
+                    items = self._do_ocr()
+                    self.ctx[save_as] = " ".join([w["text"] for w in items])
+
+                elif op == "set_var":
+                    self._set_var(_args["name"], _args["value"])
+
+                elif op == "track_series":
+                    key = sub_env(_args["key"], self.ctx)
+                    val = sub_env(str(_args["value"]), self.ctx)
+                    self._track_series(key, val, window=int(_args.get("window", 3)))
+
+                elif op == "open_student_profile":
+                    self._open_student_profile(sub_env(_args["name"], self.ctx))
+
+                elif op == "load_json":
+                    with open(sub_env(_args["path"], self.ctx), "r", encoding="utf-8") as f:
+                        self.ctx[_args["save_as"]] = json.load(f)
+
+                elif op == "run_llm":
+                    sys = sub_env(_args.get("system", ""), self.ctx)
+                    prompt = sub_env(_args.get("prompt", ""), self.ctx)
+                    out = run_llm(sys, prompt)
+                    self.ctx[_args.get("var_out", "llm_out")] = out
+
+                elif op == "if":
+                    cond = _args.get("condition", "")
+                    try:
+                        ok_cond = bool(eval(cond, {"__builtins__": {}}, {"ctx": self.ctx}))
+                    except Exception as e:
+                        self._log("error", "if.condition.error", {"error": str(e), "cond": cond})
+                        ok_cond = False
+                    self._do_steps(_args.get("then", []) if ok_cond else _args.get("else", []))
+
+                elif op == "for_each":
+                    lst = self.ctx.get(_args.get("list_var", ""), [])
+                    as_var = _args.get("as", "item")
+                    for item in lst:
+                        self.ctx[as_var] = item
+                        self._do_steps(_args.get("do", []))
+                    self.ctx.pop(as_var, None)
+
+                elif op == "for_pages":
+                    nxt_rx = _args.get("next_button_regex", "Next|Continue")
+                    until_rx = _args.get("until_regex", "Submit|Finish")
+                    while True:
+                        if self._wait_text(regex=until_rx, timeout_s=1):
+                            break
+                        self._do_steps(_args.get("do", []))
+                        self._click_text(regex=nxt_rx, prefer_bold=True)
+                        time.sleep(0.5)
+
+                elif op == "for_questions":
+                    self._do_steps(_args.get("do", []))
+
+                elif op == "choose_option_from_key":
+                    key = self.ctx.get(_args.get("key", "answer_key"), {})
+                    self._capture(force=True)
+                    words = self._do_ocr()
+                    qids = [w for w in words if re.match(r"^Q\d+$", w["text"], re.I)]
+                    for q in qids:
+                        qid = q["text"].upper()
+                        ans = key.get(qid)
+                        if ans:
+                            self._click_text(regex=f"^{re.escape(ans)}\\)", nth=0)
+
+                elif op == "screenshot":
+                    self._screenshot_save(overlay=bool(_args.get("overlay", False)), note=_args.get("note"))
+
+                elif op == "log":
+                    msg = _args.get("msg") or _args.get("") or _args.get("value") or ""
+                    self._log("info", "user.log", {"message": sub_env(str(msg), self.ctx)})
+
+                elif op == "debug_dump_ctx":
+                    if self.debug_enabled:
+                        p = os.path.join(self.run_dir, "ctx.json")
+                        with open(p, "w", encoding="utf-8") as f:
+                            json.dump(self.ctx, f, indent=2, ensure_ascii=False, default=str)
+                        self._log("info", "ctx.saved", {"path": p})
+
                 else:
-                    print("[agent] CLICK_DISABLED; would click:", chosen)
+                    self._log("warn", "op.unknown", {"op": op})
+                    ok = False
 
-                if SAVE_DEBUG:
-                    dbg = draw_debug(img, chosen)
-                    outp = f"/tmp/last_detection_{int(time.time())}.jpg"
-                    cv2.imwrite(outp, dbg)
+            except Exception as e:
+                ok = False
+                err = f"{e.__class__.__name__}: {e}"
+                tb = traceback.format_exc(limit=4)
+                self._log("error", "step.error", {"op": op, "args": _args, "error": err, "trace": tb})
 
-            loop_latency_ms = (time.perf_counter() - t0) * 1000.0
-            capture_ms = (t1 - t0) * 1000.0
-            net_infer_ms = (t2 - t1) * 1000.0
-            lat_hist.append(loop_latency_ms)
-            if len(lat_hist) > 60:
-                lat_hist.pop(0)
-            avg_ms = sum(lat_hist) / len(lat_hist)
+            # Per-step trace record
+            self._log("info", "step.done", {
+                "op": op,
+                "ok": ok,
+                "ms": int((time.time() - start_ts) * 1000),
+            })
 
-            print(f"[agent] capture={capture_ms:.1f} ms, net+infer={net_infer_ms:.1f} ms, loop={loop_latency_ms:.1f} ms (avg={avg_ms:.1f} ms)")
+    def run(self):
+        self._log("info", "agent.loop.start", {})
+        while True:
+            self._load_if_changed()
+            if not self.task:
+                time.sleep(1.0)
+                continue
+            loop = bool(self.task.get("loop", True))
+            steps = self.task.get("steps", [])
+            self._do_steps(steps)
+            self._save_summary()
+            if not loop:
+                break
+            time.sleep(0.25)
 
-            time.sleep(SLEEP_BETWEEN_LOOPS)
-
-    except KeyboardInterrupt:
-        print("[agent] Exiting.")
-
+# -----------------------
+# Main
+# -----------------------
 if __name__ == "__main__":
-    main()
+    TaskRunner(TASK_FILE).run()

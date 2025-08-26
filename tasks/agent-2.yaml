@@ -1,0 +1,37 @@
+version: 0.1
+agent: agent-2
+loop: true
+steps:
+  - open_url: "https://your.lms.example/gradebook"
+  - wait_text: { regex: "Gradebook|Grades|Students", timeout_s: 60 }
+
+  # Periodically OCR table; a helper extracts (student, latest_grade)
+  - extract_grade_table: { save_as: "grades" }  # -> list of {student, grade}
+  - for_each:
+      list_var: "grades"
+      as: "row"
+      do:
+        - track_series:  # keep last two grades per student in ctx["series"][name]
+            key: "${row.student}"
+            value: "${row.grade}"
+            window: 3
+        - if:
+            condition: |
+              len(ctx['series'].get(row['student'], [])) >= 3 and
+              ctx['series'][row['student']][-1] < ctx['series'][row['student']][-2] <
+              ctx['series'][row['student']][-3]
+            then:
+              - run_llm:
+                  var_out: "warn_mail"
+                  system: "You are a supportive instructor."
+                  prompt: |
+                    Student ${row.student} has three consecutively lower grades:
+                    ${ctx['series'][row['student']][-3:]}. Draft a brief, supportive email
+                    proposing a meeting and offering help.
+              - open_student_profile: { name: "${row.student}" }
+              - click_text: { regex: "Email|Contact" }
+              - wait: { seconds: 0.5 }
+              - type_text: "${warn_mail}"
+              - click_text: { regex: "^Send$" }
+            else: []
+  - sleep: 15.0

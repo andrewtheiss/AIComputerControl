@@ -1,0 +1,60 @@
+version: 0.1
+agent: agent-1
+loop: true
+steps:
+  - open_url: "https://www.mail.com/"
+  - wait_text:
+      any_regex: ["Inbox", "Sign in", "Mail"]
+      timeout_s: 60
+  # (Login steps are site-specific; example using keys)
+  - if:
+      condition: "not ctx.get('logged_in', False)"
+      then:
+        - click_text: { regex: "Sign in|Log in" }
+        - wait_text: { regex: "Email|Username", timeout_s: 30 }
+        - click_text: { regex: "Email|Username" }
+        - type_text: "${SECRETS_EMAIL}"     # env-substitution supported
+        - key_seq: ["Tab"]
+        - type_text: "${SECRETS_PASSWORD}"
+        - click_text: { regex: "^Sign in$|^Log in$" }
+        - set_var: { name: "logged_in", value: true }
+      else: []
+  - wait_text:
+      any_regex: ["Inbox", "Unread|New"]
+      timeout_s: 30
+  - click_text: { regex: "Unread|New|^\\(\\d+\\)$", prefer_bold: true, fuzzy: 0.85 }
+  - wait_text: { regex: "From|Subject", timeout_s: 20 }
+
+  # Open first unread (heuristic: look for lines with "Unread" or bold sender)
+  - click_text: { regex: "(Unread|^\\s*\\S+\\s+\\-)", nth: 0 }
+
+  - wait_text: { any_regex: ["From", "Reply", "Archive", "Subject"], timeout_s: 20 }
+
+  # Extract sender line and question body (basic OCR text grab)
+  - ocr_extract:
+      capture: ["From", "Subject", "Reply", "Archive"]
+      save_as: "email_page_text"  # saves text blob to ctx
+
+  # Simple rule: if 'student' appears and body seems technical, call LLM
+  - if:
+      condition: "'student' in ctx['email_page_text'].lower()"
+      then:
+        - run_llm:
+            var_out: "draft"
+            system: "You are a helpful TA."
+            prompt: |
+              The user wrote:
+              ---
+              ${email_page_text}
+              ---
+              Compose a concise, technically correct answer with actionable steps.
+        - click_text: { regex: "^Reply$|^Compose$", fuzzy: 0.8 }
+        - wait: { seconds: 1.0 }
+        - type_text: "${draft}"
+        - click_text: { regex: "^Send$|^Reply$", fuzzy: 0.8 }
+        - wait: { seconds: 1.0 }
+        - click_text: { regex: "^Archive$|^Done$", fuzzy: 0.8 }
+      else: []
+
+  # Small idle to avoid hammering
+  - sleep: 5.0

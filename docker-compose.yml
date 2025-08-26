@@ -29,10 +29,14 @@ services:
     container_name: vnc-instance-1
     ports:
       - "5901:5901"
+    volumes:
+      - ./tasks:/tasks:rw
     gpus:
       - device_ids: ["0"]
         capabilities: ["gpu"]
     environment:
+      AGENT_NAME: "agent-1"
+      AGENT_TASK: "/tasks/agent-1.yaml"
       RTDETR_API_URL: "http://rtdetr-api:8000/predict"   # <-- key line
       NVIDIA_VISIBLE_DEVICES: "0"
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
@@ -47,10 +51,14 @@ services:
     container_name: vnc-instance-2
     ports:
       - "5902:5901"
+    volumes:
+      - ./tasks:/tasks:rw
     gpus:
       - device_ids: ["0"]
         capabilities: ["gpu"]
     environment:
+      AGENT_NAME: "agent-2"
+      AGENT_TASK: "/tasks/agent-2.yaml"
       RTDETR_API_URL: "http://rtdetr-api:8000/predict"   # <-- key line
       NVIDIA_VISIBLE_DEVICES: "0"
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
