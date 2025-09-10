@@ -34,6 +34,8 @@ RUN apt-get update && \
     x11-apps \
     x11-xserver-utils \
     pm-utils \
+    curl \
+    jq \
     && \
     rm -rf /var/lib/apt/lists/*
 

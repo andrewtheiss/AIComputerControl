@@ -14,6 +14,15 @@ from rapidfuzz import fuzz, process as fuzz_process
 # -----------------------
 # Config
 # -----------------------
+# --- New config (top of file) ---
+AGENT_MODE       = os.environ.get("AGENT_MODE", "static")
+AGENT_GOAL       = os.environ.get("AGENT_GOAL", "").strip()
+TASK_PLANNER_URL = os.environ.get("TASK_PLANNER_URL", "http://localhost:8000/v1/actions/next")
+PLANNER_API_KEY  = os.environ.get("PLANNER_API_KEY", "")      # optional, see §3.4
+MAX_STEPS        = int(os.environ.get("MAX_STEPS", "80"))
+HISTORY_WINDOW   = int(os.environ.get("HISTORY_WINDOW", "10"))
+OCR_LIMIT        = int(os.environ.get("OCR_LIMIT", "400"))     # cap tokens
+
 API_URL = os.environ.get("RTDETR_API_URL", "http://rtdetr-api:8000/predict")
 AGENT_NAME = os.environ.get("AGENT_NAME", "agent-1")
 TASK_FILE = os.environ.get("AGENT_TASK", f"/tasks/{AGENT_NAME}.yaml")
@@ -48,6 +57,10 @@ def which(cmd: str) -> Optional[str]:
         if os.path.isfile(fp) and os.access(fp, os.X_OK):
             return fp
     return None
+
+def redact_if_confidential(s: str, confidential: bool) -> str:
+    return "[REDACTED]" if confidential else s
+
 
 # -----------------------
 # Screen capture
@@ -688,8 +701,167 @@ class TaskRunner:
                 break
             time.sleep(0.25)
 
+#------------------------
+# ActionExecutorDynamic
+#------------------------
+class ActionExecutorDynamic:
+    """Dynamic observe→decide→act executor."""
+    def __init__(self):
+        self.session = requests.Session()
+        self.ctx: Dict[str, Any] = {}           # user-visible context (ocr_extract etc.)
+        self.history: List[Dict[str, Any]] = [] # rolling action history
+        self.grabber = ScreenGrabber(screen_index=SCREEN_INDEX)
+        self.last_img: Optional[np.ndarray] = None
+        self.last_ocr: List[Dict[str, Any]] = []
+        self._xdotool_ok = which("xdotool") is not None
+
+    # --- Logging, capture, OCR ---
+    def _log(self, level: str, msg: str, extra: Optional[Dict[str, Any]] = None):
+        rec = {"ts": now_utc_iso(), "level": level, "msg": msg}
+        if extra: rec.update(extra)
+        line = safe_json_dumps(rec)
+        print(line, flush=True)
+
+    def _capture_state(self):
+        img, _ = self.grabber.capture()
+        self.last_img = img
+        self.last_ocr = ocr_image(img)
+        # truncate OCR to reduce token size (keep bigger words first)
+        self.last_ocr = sorted(self.last_ocr, key=lambda w: (-(w["box"][3]-w["box"][1]), -w["conf"]))[:OCR_LIMIT]
+        self._log("debug", "state.captured", {"ocr_items": len(self.last_ocr)})
+
+    # --- Action impls (call your existing primitives) ---
+    def _action_click_text(self, regex: str, nth: int = 0, prefer_bold: bool = False):
+        if not self.last_ocr:
+            return {"status": "failure", "error_code": "NO_OCR", "error_message": "No OCR results yet"}
+        w = find_text_box(self.last_ocr, regex=regex, nth=nth, prefer_bold=prefer_bold)
+        if not w:
+            return {"status": "failure", "error_code": "ELEMENT_NOT_FOUND",
+                    "error_message": f"Regex '{regex}' not found"}
+        x1,y1,x2,y2 = w["box"]; cx,cy = (x1+x2)//2, (y1+y2)//2
+        x_abs,y_abs = self.grabber.to_abs(cx,cy)
+        if not CLICK_ENABLED or not self._xdotool_ok:
+            return {"status": "failure", "error_code": "CLICK_DISABLED_OR_MISSING_XDOTOOL",
+                    "error_message": "CLICK_ENABLED=0 or xdotool missing"}
+        _safe_run(["xdotool","mousemove","--sync",str(x_abs),str(y_abs)])
+        _safe_run(["xdotool","click","1"])
+        return {"status": "success", "clicked": w["text"], "box": w["box"]}
+
+    def _action_type_text(self, text: str, confidential: bool = False):
+        # Allow ${VAR} substitution from env/ctx
+        def repl(m): 
+            key = m.group(1)
+            return str(os.environ.get(key, self.ctx.get(key, "")))
+        s = re.sub(r"\$\{([^}]+)\}", repl, text)
+        # Use your robust multi-line typer
+        lines = s.splitlines()
+        for i, line in enumerate(lines):
+            _safe_run(["xdotool","type","--clearmodifiers", line])
+            if i < len(lines) - 1:
+                _safe_run(["xdotool","key","Return"])
+        return {"status": "success", "typed_chars": len(s), "preview": redact_if_confidential(s[:8]+"...", confidential)}
+
+    def _action_key_seq(self, keys: List[str]):
+        for k in keys: _safe_run(["xdotool","key",k])
+        return {"status": "success", "keys": keys}
+
+    def _action_wait_text(self, regex: str, timeout_s: int = 20):
+        t0 = time.time()
+        while time.time() - t0 <= timeout_s:
+            self._capture_state()
+            if find_text_box(self.last_ocr, regex=regex):
+                return {"status": "success", "regex": regex}
+            time.sleep(0.4)
+        return {"status": "failure", "error_code": "TIMEOUT", "error_message": f"wait_text timeout for '{regex}'"}
+
+    def _action_ocr_extract(self, save_as: str):
+        text = " ".join(w["text"] for w in self.last_ocr)
+        self.ctx[save_as] = text
+        return {"status": "success", "var": save_as, "len": len(text)}
+
+    def _action_open_url(self, url: str):
+        if which("firefox-esr"):
+            subprocess.Popen(["firefox-esr","--new-window",url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elif which("xdg-open"):
+            subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            subprocess.Popen(["firefox", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return {"status": "success", "url": url}
+
+    # --- Planner request/response ---
+    def _post_to_planner(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        headers = {"Content-Type":"application/json"}
+        if PLANNER_API_KEY:
+            headers["Authorization"] = f"Bearer {PLANNER_API_KEY}"
+        try:
+            r = self.session.post(TASK_PLANNER_URL, headers=headers, json=payload, timeout=120)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            self._log("error","planner.request.failed",{"error": str(e)})
+            return None
+
+    def run(self):
+        if not AGENT_GOAL:
+            self._log("error", "executor.abort", {"reason": "AGENT_GOAL empty"})
+            return
+
+        step = 0
+        while step < MAX_STEPS:
+            # 1) Observe
+            self._capture_state()
+            ocr_min = [{"text": w["text"], "box": w["box"], "conf": w["conf"]} for w in self.last_ocr]
+
+            # 2) Report
+            payload = {
+                "goal": AGENT_GOAL,
+                "task_history": self.history[-HISTORY_WINDOW:],
+                "ocr_results": ocr_min,
+                "available_actions": [
+                    "open_url","wait_text","click_text","type_text","key_seq",
+                    "ocr_extract","end_task"
+                ]
+            }
+            resp = self._post_to_planner(payload)
+            if not resp:
+                time.sleep(2)
+                continue
+
+            action = resp.get("action")
+            params = resp.get("parameters", {})
+            reasoning = resp.get("reasoning","")
+            completed = bool(resp.get("completed", False))
+            self._log("info","planner.decision",{"action": action, "params": params, "why": reasoning})
+
+            # 3) Act
+            result = {"status":"failure","error_code":"UNKNOWN_ACTION","error_message": action}
+            try:
+                if action == "open_url":    result = self._action_open_url(**params)
+                elif action == "wait_text":  result = self._action_wait_text(**params)
+                elif action == "click_text": result = self._action_click_text(**params)
+                elif action == "type_text":  result = self._action_type_text(**params)
+                elif action == "key_seq":    result = self._action_key_seq(**params)
+                elif action == "ocr_extract":result = self._action_ocr_extract(**params)
+                elif action == "end_task":
+                    self._log("info","executor.stop",{"reason": params.get("reason","planner requested end")})
+                    break
+            except Exception as e:
+                result = {"status":"failure","error_code":"EXCEPTION","error_message": str(e)}
+
+            # 4) Record
+            self.history.append({"action": action, "parameters": params, "result": result})
+            self._log("info","action.result",{"action": action, "result": result})
+            step += 1
+            time.sleep(0.8)
+ 
 # -----------------------
 # Main
 # -----------------------
+# --- Entrypoint tweak: choose static vs dynamic ---
 if __name__ == "__main__":
-    TaskRunner(TASK_FILE).run()
+    if AGENT_MODE == "dynamic":
+        ActionExecutorDynamic().run()
+    else:
+        TaskRunner(TASK_FILE).run()   # your original YAML path
+
+       

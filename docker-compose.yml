@@ -26,6 +26,9 @@ services:
 
   vnc-instance-1:
     image: ai-sandbox
+    build:
+      context: ./agent          # <- folder that contains the Dockerfile you pasted
+      dockerfile: Dockerfile
     container_name: vnc-instance-1
     ports:
       - "5901:5901"
@@ -40,6 +43,8 @@ services:
       RTDETR_API_URL: "http://rtdetr-api:8000/predict"   # <-- key line
       NVIDIA_VISIBLE_DEVICES: "0"
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      TASK_PLANNER_URL: http://task-planner:8000/v1/actions/next
+      PLANNER_API_KEY: taskPlannerApiSecret
     restart: unless-stopped
     depends_on:
       - rtdetr-api
@@ -62,9 +67,28 @@ services:
       RTDETR_API_URL: "http://rtdetr-api:8000/predict"   # <-- key line
       NVIDIA_VISIBLE_DEVICES: "0"
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      TASK_PLANNER_URL: http://task-planner:8000/v1/actions/next
+      PLANNER_API_KEY: taskPlannerApiSecret
     restart: unless-stopped
     depends_on:
       - rtdetr-api
+    networks:
+      - ai-net
+
+  task-planner:
+    build:
+      context: ./taskPlanner
+      dockerfile: Dockerfile
+    container_name: task-planner
+    ports:
+      - "8010:8000"
+    environment:
+      PLANNER_API_KEY: taskPlannerApiSecret
+      OLLAMA_OPENAI_BASE: http://host.docker.internal:11434/v1
+      OLLAMA_MODEL: gpt-oss:120b
+    # map host.docker.internal on Linux (Desktop already provides it)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     networks:
       - ai-net
 

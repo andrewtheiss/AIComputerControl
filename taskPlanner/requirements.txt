@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+taskgen-ai==3.3.4
+openai>=1.40.0
+pydantic>=2.6
+python-dotenv
+orjson
+tenacity
+
