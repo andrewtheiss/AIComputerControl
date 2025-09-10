@@ -89,6 +89,10 @@ Rules:
 - If a previous action failed (see last history.result), try a different strategy (wait, alternate regex, etc.).
 - Never reference UI elements not present in OCR.
 - Prefer generic auth patterns: find Login/Sign in, then username/email then password then submit, then wait for Inbox.
+
+If matching UI by text with synonyms, prefer wait_any_text() or click_any_text().
+If the clickable icon is adjacent to anchor text, prefer click_near_text(anchor, small dx/dy).
+Insert short sleep() (0.5–1.2s) between navigation and waits to stabilize the UI.
 """
 
 def make_user_prompt(req: PlannerRequest) -> str:

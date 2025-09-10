@@ -730,6 +730,62 @@ class ActionExecutorDynamic:
         self.last_ocr = sorted(self.last_ocr, key=lambda w: (-(w["box"][3]-w["box"][1]), -w["conf"]))[:OCR_LIMIT]
         self._log("debug", "state.captured", {"ocr_items": len(self.last_ocr)})
 
+    def _action_wait_any_text(self, patterns, timeout_s: int = 20):
+        import re, time
+        compiled = [re.compile(pat, re.I) for pat in patterns]
+        t0 = time.time()
+        while time.time() - t0 <= timeout_s:
+            self._capture_state()
+            found = None
+            for w in self.last_ocr:
+                for rx in compiled:
+                    if rx.search(w["text"]):
+                        found = {"text": w["text"], "box": w["box"]}
+                        break
+                if found:
+                    break
+            if found:
+                return {"status":"success","match": found}
+            time.sleep(0.4)
+        return {"status":"failure","error_code":"TIMEOUT_ANY","error_message": f"None matched in {patterns}"}
+
+    def _action_click_any_text(self, patterns, nth: int = 0, prefer_bold: bool = True):
+        # try each regex in order until one has a match
+        import re
+        for pat in patterns:
+            w = find_text_box(
+                self.last_ocr,
+                regex=pat,
+                nth=nth,
+                prefer_bold=prefer_bold
+            )
+            if w:
+                x1,y1,x2,y2 = w["box"]; cx,cy = (x1+x2)//2, (y1+y2)//2
+                x_abs,y_abs = self.grabber.to_abs(cx,cy)
+                if not CLICK_ENABLED or not self._xdotool_ok:
+                    return {"status":"failure","error_code":"CLICK_DISABLED_OR_MISSING_XDOTOOL"}
+                _safe_run(["xdotool","mousemove","--sync",str(x_abs),str(y_abs)])
+                _safe_run(["xdotool","click","1"])
+                return {"status":"success","clicked": w["text"], "box": w["box"], "pattern_used": pat}
+        return {"status":"failure","error_code":"ELEMENT_NOT_FOUND","error_message": f"No pattern matched: {patterns}"}
+
+    def _action_click_near_text(self, anchor_regex: str, dx: int = 0, dy: int = 0):
+        import re
+        w = find_text_box(self.last_ocr, regex=anchor_regex)
+        if not w:
+            return {"status":"failure","error_code":"ANCHOR_NOT_FOUND","error_message": anchor_regex}
+        x1,y1,x2,y2 = w["box"]; cx,cy = (x1+x2)//2, (y1+y2)//2
+        x_abs,y_abs = self.grabber.to_abs(cx+dx, cy+dy)
+        if not CLICK_ENABLED or not self._xdotool_ok:
+            return {"status":"failure","error_code":"CLICK_DISABLED_OR_MISSING_XDOTOOL"}
+        _safe_run(["xdotool","mousemove","--sync",str(x_abs),str(y_abs)])
+        _safe_run(["xdotool","click","1"])
+        return {"status":"success","anchor": w["text"], "anchor_box": w["box"], "offset": [dx,dy]}
+
+    def _action_sleep(self, seconds: float = 0.8):
+        time.sleep(float(seconds))
+        return {"status":"success","slept_seconds": float(seconds)}
+
     # --- Action impls (call your existing primitives) ---
     def _action_click_text(self, regex: str, nth: int = 0, prefer_bold: bool = False):
         if not self.last_ocr:
@@ -801,6 +857,14 @@ class ActionExecutorDynamic:
             self._log("error","planner.request.failed",{"error": str(e)})
             return None
 
+                
+    # Optional LLM helper (if you want replies drafted by LLM)
+    def _action_run_llm(self, system: str, prompt: str, var_out: str = "draft"):
+        out = run_llm(system, prompt)  # uses your existing helper & env
+        self.ctx[var_out] = out
+        return {"status": "success", "var_out": var_out, "chars": len(out)}
+
+
     def run(self):
         if not AGENT_GOAL:
             self._log("error", "executor.abort", {"reason": "AGENT_GOAL empty"})
@@ -818,8 +882,9 @@ class ActionExecutorDynamic:
                 "task_history": self.history[-HISTORY_WINDOW:],
                 "ocr_results": ocr_min,
                 "available_actions": [
-                    "open_url","wait_text","click_text","type_text","key_seq",
-                    "ocr_extract","end_task"
+                    "open_url","wait_text","wait_any_text",
+                    "click_text","click_any_text","click_near_text",
+                    "type_text","key_seq","sleep","ocr_extract","end_task"
                 ]
             }
             resp = self._post_to_planner(payload)
@@ -838,6 +903,11 @@ class ActionExecutorDynamic:
             try:
                 if action == "open_url":    result = self._action_open_url(**params)
                 elif action == "wait_text":  result = self._action_wait_text(**params)
+                elif action == "wait_any_text":   result = self._action_wait_any_text(**params)
+                elif action == "click_any_text":  result = self._action_click_any_text(**params)
+                elif action == "click_near_text": result = self._action_click_near_text(**params)
+                elif action == "run_llm":         result = self._action_run_llm(**params)
+                elif action == "sleep":           result = self._action_sleep(**params)
                 elif action == "click_text": result = self._action_click_text(**params)
                 elif action == "type_text":  result = self._action_type_text(**params)
                 elif action == "key_seq":    result = self._action_key_seq(**params)

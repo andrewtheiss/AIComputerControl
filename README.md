@@ -133,3 +133,6 @@ To get a shell inside a specific container for debugging:
 
 ```bash
 docker exec -it vnc-instance-1 /bin/bash
+
+docker compose build --no-cache
+docker compose up -d --force-recreate vnc-instance-1 vnc-instance-2 task-planner

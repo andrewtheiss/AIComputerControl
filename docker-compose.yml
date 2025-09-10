@@ -38,13 +38,15 @@ services:
       - device_ids: ["0"]
         capabilities: ["gpu"]
     environment:
-      AGENT_NAME: "agent-1"
-      AGENT_TASK: "/tasks/agent-1.yaml"
+      AGENT_MODE: dynamic
       RTDETR_API_URL: "http://rtdetr-api:8000/predict"   # <-- key line
       NVIDIA_VISIBLE_DEVICES: "0"
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
       TASK_PLANNER_URL: http://task-planner:8000/v1/actions/next
       PLANNER_API_KEY: taskPlannerApiSecret
+      AGENT_GOAL: "Wait for Gmail to login and get to Inbox.  After, compose emails to andrew.theiss@gmail.com and mention that his AI is working"
+      SECRETS_EMAIL: "abc@example.com used with ${SECRETS_EMAIL} in other feilds"
+      SECRETS_PASSWORD: "correcthorsebatterystaple"
     restart: unless-stopped
     depends_on:
       - rtdetr-api
@@ -62,13 +64,15 @@ services:
       - device_ids: ["0"]
         capabilities: ["gpu"]
     environment:
-      AGENT_NAME: "agent-2"
-      AGENT_TASK: "/tasks/agent-2.yaml"
+      AGENT_MODE: dynamic
       RTDETR_API_URL: "http://rtdetr-api:8000/predict"   # <-- key line
       NVIDIA_VISIBLE_DEVICES: "0"
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
       TASK_PLANNER_URL: http://task-planner:8000/v1/actions/next
       PLANNER_API_KEY: taskPlannerApiSecret
+      AGENT_GOAL: "Login to mail.com with user: ${SECRETS_EMAIL}, pass: ${SECRETS_PASSWORD}, then wait for Inbox"
+      SECRETS_EMAIL: "abc@example.com"
+      SECRETS_PASSWORD: "correcthorsebatterystaple"
     restart: unless-stopped
     depends_on:
       - rtdetr-api
