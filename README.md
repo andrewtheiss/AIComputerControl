@@ -136,3 +136,11 @@ docker exec -it vnc-instance-1 /bin/bash
 
 docker compose build --no-cache
 docker compose up -d --force-recreate vnc-instance-1 vnc-instance-2 task-planner
+
+# Setup:
+mkdir -p ./profiles/agent-1
+docker cp vnc-instance-1:/root/.mozilla ./profiles/agent-1/.mozilla
+docker cp vnc-instance-1:/root/.cache/mozilla ./profiles/agent-1/.cache/mozilla
+# then add the volume mounts and restart the container
+
+

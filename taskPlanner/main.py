@@ -89,10 +89,21 @@ Rules:
 - If a previous action failed (see last history.result), try a different strategy (wait, alternate regex, etc.).
 - Never reference UI elements not present in OCR.
 - Prefer generic auth patterns: find Login/Sign in, then username/email then password then submit, then wait for Inbox.
+- After clicking a navigation control (e.g., Compose), ALWAYS confirm the new state with wait_any_text([...]) before typing.
+- For Gmail compose, ONLY anchor on 'To'/'Recipients'/'Subject'/'Send', NEVER on the account email (it contains '@' and is in the header).
+- Prefer keyboard shortcuts only after confirming the app is focused (e.g., wait_any_text detects 'Inbox' or 'Compose' first).
 
 If matching UI by text with synonyms, prefer wait_any_text() or click_any_text().
 If the clickable icon is adjacent to anchor text, prefer click_near_text(anchor, small dx/dy).
 Insert short sleep() (0.5–1.2s) between navigation and waits to stabilize the UI.
+
+GMAIL COMPOSE RECIPE (use if Gmail is detected by OCR):
+1) Ensure focus: wait_any_text(["Inbox","Compose","Primary"], 15), sleep(0.5).
+2) Open compose: click_any_text(["^Compose$","^New message$","^New mail$","^\\+$"]), or key_seq(["c"]); then wait_any_text(["^To$","^Recipients$","^Subject$","^New message$"], 10).
+3) Focus 'To': click_text("^To$|^Recipients$"), sleep(0.2), type_text("${RECIPIENT}", confidential=false).
+4) Focus 'Subject': click_text("^Subject$"), sleep(0.2), type_text("${SUBJECT}").
+5) Focus body: click_near_text("^Subject$", 0, 50) OR key_seq(["Tab","Tab"]), sleep(0.2), type_text("${BODY}").
+6) Send: click_any_text(["^Send$","^Send\\s*$"]) OR key_seq(["ctrl+Return"]), then wait_any_text(["Message sent","Sent","Undo"], 8).
 """
 
 def make_user_prompt(req: PlannerRequest) -> str:
@@ -111,6 +122,18 @@ def make_user_prompt(req: PlannerRequest) -> str:
     )
 
 app = FastAPI(title="TaskPlanner API", version="1.0.0")
+
+def normalize_params(action: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    p = dict(params or {})
+    if "timeout" in p and "timeout_s" not in p:
+        p["timeout_s"] = p.pop("timeout")
+    if action == "click_text" and "text" in p and "regex" not in p:
+        p["regex"] = p.pop("text")
+    if action in ("wait_any_text", "click_any_text") and "texts" in p and "patterns" not in p:
+        p["patterns"] = p.pop("texts")
+    if action == "click_near_text" and "anchor" in p and "anchor_regex" not in p:
+        p["anchor_regex"] = p.pop("anchor")
+    return p
 
 @retry(wait=wait_exponential(min=0.5, max=4), stop=stop_after_attempt(3))
 async def _decide(req: PlannerRequest) -> PlannerResponse:
@@ -136,6 +159,10 @@ async def _decide(req: PlannerRequest) -> PlannerResponse:
                "parameters":{"reason":f"Invalid action {obj.get('action')}"},
                "reasoning":"Planner filtered to safe action set",
                "completed": True}
+
+    # Planner-side parameter normalization to reduce executor work
+    act = obj.get("action")
+    obj["parameters"] = normalize_params(act, obj.get("parameters", {}))
 
     return PlannerResponse(**obj)
 

@@ -31,7 +31,8 @@ def wait_text(regex: str, timeout_s: int = 20) -> str:
 
 def wait_any_text(patterns: List[str], timeout_s: int = 20) -> str:
     """
-    Wait until ANY of the provided case-insensitive regex patterns appear in OCR.
+    Wait until ANY of patterns appear.
+    Parameters: patterns (alias: texts), timeout_s (alias: timeout).
 
     Args:
       patterns: A list of regex strings. Example: ["Inbox", "Mailbox", "New mail"].
@@ -44,7 +45,8 @@ def wait_any_text(patterns: List[str], timeout_s: int = 20) -> str:
 
 def click_text(regex: str, nth: int = 0, prefer_bold: bool = False) -> str:
     """
-    Click a UI element whose OCR text matches the regex.
+    Click element whose OCR matches regex.
+    Parameters: regex (alias: text), nth, prefer_bold.
 
     Args:
       regex: Case-insensitive regex for the visible text.
@@ -59,7 +61,8 @@ def click_text(regex: str, nth: int = 0, prefer_bold: bool = False) -> str:
 
 def click_any_text(patterns: List[str], nth: int = 0, prefer_bold: bool = True) -> str:
     """
-    Click the first match among multiple regex patterns.
+    Click first match among patterns.
+    Parameters: patterns (alias: texts), nth, prefer_bold.
 
     Args:
       patterns: Ordered list of regex choices, highest priority first.
@@ -73,8 +76,11 @@ def click_any_text(patterns: List[str], nth: int = 0, prefer_bold: bool = True) 
 
 def click_near_text(anchor_regex: str, dx: int = 0, dy: int = 0) -> str:
     """
-    Click at a pixel offset from the center of the first OCR word that matches anchor_regex.
-
+    Click at an offset from the center of the FIRST OCR word matching anchor_regex.
+    Parameters: anchor_regex (alias: anchor), dx, dy.
+    Guidance:
+      - Use field labels as anchors (e.g., '^To$','^Recipients$','^Subject$').
+      - DO NOT anchor on the account email (contains '@') or app header chrome.
     Args:
       anchor_regex: Regex to locate the anchor word/label.
       dx: Horizontal offset in pixels (positive = right).
@@ -116,6 +122,7 @@ def key_seq(keys: List[str]) -> str:
 def sleep(seconds: float = 0.8) -> str:
     """
     Idle for a short period.
+    Parameters: seconds.
 
     Args:
       seconds: Fractional seconds to sleep.

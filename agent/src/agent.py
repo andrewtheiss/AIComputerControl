@@ -722,6 +722,77 @@ class ActionExecutorDynamic:
         line = safe_json_dumps(rec)
         print(line, flush=True)
 
+    def _canonicalize_params(self, action: str, params: dict) -> dict:
+        """Map common LLM synonyms to the executor's canonical arg names and drop unknowns."""
+        p = dict(params or {})
+
+        # Global aliases
+        if "timeout" in p and "timeout_s" not in p:
+            p["timeout_s"] = p.pop("timeout")
+        if "seconds" in p and "timeout_s" not in p and action == "sleep":
+            # keep seconds as-is for sleep, don't rename
+            pass
+
+        if action == "click_text":
+            # Accept 'text' as alias for 'regex'
+            if "text" in p and "regex" not in p:
+                p["regex"] = p.pop("text")
+            # keep only valid keys
+            allow = {"regex", "nth", "prefer_bold"}
+            return {k: v for k, v in p.items() if k in allow}
+
+        if action == "wait_text":
+            allow = {"regex", "timeout_s"}
+            return {k: v for k, v in p.items() if k in allow}
+
+        if action == "wait_any_text":
+            # 'texts' -> 'patterns'
+            if "texts" in p and "patterns" not in p:
+                p["patterns"] = p.pop("texts")
+            allow = {"patterns", "timeout_s"}
+            return {k: v for k, v in p.items() if k in allow}
+
+        if action == "click_any_text":
+            # 'texts' -> 'patterns'
+            if "texts" in p and "patterns" not in p:
+                p["patterns"] = p.pop("texts")
+            allow = {"patterns", "nth", "prefer_bold"}
+            return {k: v for k, v in p.items() if k in allow}
+
+        if action == "click_near_text":
+            # 'anchor' -> 'anchor_regex'
+            if "anchor" in p and "anchor_regex" not in p:
+                p["anchor_regex"] = p.pop("anchor")
+            allow = {"anchor_regex", "dx", "dy"}
+            return {k: v for k, v in p.items() if k in allow}
+
+        if action == "type_text":
+            allow = {"text", "confidential"}
+            return {k: v for k, v in p.items() if k in allow}
+
+        if action == "key_seq":
+            allow = {"keys"}
+            return {k: v for k, v in p.items() if k in allow}
+
+        if action == "sleep":
+            allow = {"seconds"}
+            return {k: v for k, v in p.items() if k in allow}
+
+        if action == "ocr_extract":
+            allow = {"save_as"}
+            return {k: v for k, v in p.items() if k in allow}
+
+        if action == "open_url":
+            allow = {"url"}
+            return {k: v for k, v in p.items() if k in allow}
+
+        if action == "end_task":
+            allow = {"reason"}
+            return {k: v for k, v in p.items() if k in allow}
+
+        # Default: pass through
+        return p
+
     def _capture_state(self):
         img, _ = self.grabber.capture()
         self.last_img = img
@@ -775,6 +846,9 @@ class ActionExecutorDynamic:
         if not w:
             return {"status":"failure","error_code":"ANCHOR_NOT_FOUND","error_message": anchor_regex}
         x1,y1,x2,y2 = w["box"]; cx,cy = (x1+x2)//2, (y1+y2)//2
+        # Guard against header/account anchors (e.g., email in header)
+        if "@" in w.get("text", "") and cy < 80:
+            return {"status":"failure","error_code":"ANCHOR_REJECTED_HEADER","error_message": w.get("text", "")}
         x_abs,y_abs = self.grabber.to_abs(cx+dx, cy+dy)
         if not CLICK_ENABLED or not self._xdotool_ok:
             return {"status":"failure","error_code":"CLICK_DISABLED_OR_MISSING_XDOTOOL"}
@@ -817,9 +891,58 @@ class ActionExecutorDynamic:
                 _safe_run(["xdotool","key","Return"])
         return {"status": "success", "typed_chars": len(s), "preview": redact_if_confidential(s[:8]+"...", confidential)}
 
+    def _normalize_key_sequence(self, keys: list) -> list:
+        """
+        Turn ["CTRL","ENTER"] into ["ctrl+Return"], normalize case, keep existing combos like "ctrl+Shift+Tab".
+        """
+        out = []
+        i = 0
+        to_lower = lambda s: s.lower().replace(" ", "")
+
+        while i < len(keys):
+            k = keys[i]
+            k_low = to_lower(k)
+
+            # ctrl + enter / return / kp_enter
+            if k_low in ("ctrl","control") and i + 1 < len(keys):
+                nxt = to_lower(keys[i+1])
+                if nxt in ("enter","return","kp_enter"):
+                    out.append("ctrl+Return" if nxt != "kp_enter" else "ctrl+KP_Enter")
+                    i += 2
+                    continue
+
+            # ctrl + shift + enter, common for "Send & archive"
+            if k_low in ("ctrl","control") and i + 2 < len(keys):
+                nxt = to_lower(keys[i+1]); nxt2 = to_lower(keys[i+2])
+                if nxt in ("shift") and nxt2 in ("enter","return","kp_enter"):
+                    out.append("ctrl+Shift+Return" if nxt2 != "kp_enter" else "ctrl+Shift+KP_Enter")
+                    i += 3
+                    continue
+
+            # If already a combo like "ctrl+Return" or "shift+tab", keep as-is
+            if "+" in k:
+                out.append(k)
+            else:
+                # normalize some common names to xdotool names
+                mapping = {
+                    "enter": "Return",
+                    "return": "Return",
+                    "esc": "Escape",
+                    "escape": "Escape",
+                    "space": "space",
+                    "tab": "Tab",
+                }
+                out.append(mapping.get(k_low, k))
+            i += 1
+
+        return out
+
+
     def _action_key_seq(self, keys: List[str]):
-        for k in keys: _safe_run(["xdotool","key",k])
-        return {"status": "success", "keys": keys}
+        seq = self._normalize_key_sequence(keys)
+        for k in seq:
+            _safe_run(["xdotool", "key", "--clearmodifiers", k])
+        return {"status": "success", "keys": seq}
 
     def _action_wait_text(self, regex: str, timeout_s: int = 20):
         t0 = time.time()
@@ -892,35 +1015,39 @@ class ActionExecutorDynamic:
                 time.sleep(2)
                 continue
 
-            action = resp.get("action")
-            params = resp.get("parameters", {})
+            op = resp.get("action")
+            params = resp.get("args", {}) or resp.get("parameters", {}) or {}
+            params = self._canonicalize_params(op, params)
             reasoning = resp.get("reasoning","")
             completed = bool(resp.get("completed", False))
-            self._log("info","planner.decision",{"action": action, "params": params, "why": reasoning})
+            self._log("info","planner.decision",{"action": op, "params": params, "why": reasoning})
 
             # 3) Act
-            result = {"status":"failure","error_code":"UNKNOWN_ACTION","error_message": action}
+            result = {"status":"failure","error_code":"UNKNOWN_ACTION","error_message": op}
             try:
-                if action == "open_url":    result = self._action_open_url(**params)
-                elif action == "wait_text":  result = self._action_wait_text(**params)
-                elif action == "wait_any_text":   result = self._action_wait_any_text(**params)
-                elif action == "click_any_text":  result = self._action_click_any_text(**params)
-                elif action == "click_near_text": result = self._action_click_near_text(**params)
-                elif action == "run_llm":         result = self._action_run_llm(**params)
-                elif action == "sleep":           result = self._action_sleep(**params)
-                elif action == "click_text": result = self._action_click_text(**params)
-                elif action == "type_text":  result = self._action_type_text(**params)
-                elif action == "key_seq":    result = self._action_key_seq(**params)
-                elif action == "ocr_extract":result = self._action_ocr_extract(**params)
-                elif action == "end_task":
-                    self._log("info","executor.stop",{"reason": params.get("reason","planner requested end")})
+                if op == "done" or op == "end_task":
+                    self._log("info", "task.complete", {"reason": params.get("reason","planner requested end")})
                     break
+                if op == "open_url":         result = self._action_open_url(**params)
+                elif op == "wait_text":      result = self._action_wait_text(**params)
+                elif op == "wait_any_text":  result = self._action_wait_any_text(**params)
+                elif op == "click_text":     result = self._action_click_text(**params)
+                elif op == "click_any_text": result = self._action_click_any_text(**params)
+                elif op == "click_near_text":result = self._action_click_near_text(**params)
+                elif op == "type_text":      result = self._action_type_text(**params)
+                elif op == "key_seq":        result = self._action_key_seq(**params)
+                elif op == "sleep":          result = self._action_sleep(**params)
+                elif op == "ocr_extract":    result = self._action_ocr_extract(**params)
+                elif op == "run_llm":        result = self._action_run_llm(**params)
+                # Debounce after successful clicks
+                if op in ("click_text","click_any_text","click_near_text") and result.get("status") == "success":
+                    time.sleep(0.25)
             except Exception as e:
                 result = {"status":"failure","error_code":"EXCEPTION","error_message": str(e)}
 
             # 4) Record
-            self.history.append({"action": action, "parameters": params, "result": result})
-            self._log("info","action.result",{"action": action, "result": result})
+            self.history.append({"action": op, "parameters": params, "result": result})
+            self._log("info","action.result",{"action": op, "result": result})
             step += 1
             time.sleep(0.8)
  
