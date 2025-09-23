@@ -34,8 +34,9 @@ services:
       - "5901:5901"
     volumes:
       - ./tasks:/tasks:rw
-      - ./profiles/agent-1/.mozilla:/root/.mozilla:rw
-      - ./profiles/agent-1/.cache/mozilla:/root/.cache/mozilla:rw
+      # Mount host Firefox Snap profile and cache into container
+      - /home/theiss/snap/firefox/common/.mozilla:/root/.mozilla:rw
+      - /home/theiss/snap/firefox/common/.cache/mozilla:/root/.cache/mozilla:rw
     gpus:
       - device_ids: ["0"]
         capabilities: ["gpu"]
@@ -46,12 +47,16 @@ services:
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
       TASK_PLANNER_URL: http://task-planner:8000/v1/actions/next
       PLANNER_API_KEY: taskPlannerApiSecret
+      # Explicitly set Firefox binary and profile (adjust profile dir name if different)
+      FIREFOX_BIN: "/usr/bin/firefox-esr"
+      FIREFOX_PROFILE_PATH: "/root/.mozilla/firefox/agent1.default-esr"
       AGENT_GOAL: "Wait for Gmail to login and get to Inbox.  Once in inbox... Continually do the following: Compose emails to andrew.theiss@gmail.com and mention that his AI is working.  Send the email.  If not on the Compose Email Page, go back to Inbox.  Repeat 5 times.  Go to sent mail and verify the message was sent each time."
-      SECRETS_EMAIL: "abc@example.com used with ${SECRETS_EMAIL} in other feilds"
+      SECRETS_EMAIL: "abc@example.com"
       SECRETS_PASSWORD: "correcthorsebatterystaple"
     restart: unless-stopped
     depends_on:
       - rtdetr-api
+      - task-planner
     networks:
       - ai-net
 
@@ -74,12 +79,15 @@ services:
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
       TASK_PLANNER_URL: http://task-planner:8000/v1/actions/next
       PLANNER_API_KEY: taskPlannerApiSecret
+      FIREFOX_BIN: "/usr/bin/firefox-esr"
+      FIREFOX_PROFILE_PATH: "/root/.mozilla/firefox/agent2.default-esr"
       AGENT_GOAL: "Login to mail.com with user: ${SECRETS_EMAIL}, pass: ${SECRETS_PASSWORD}, then wait for Inbox"
       SECRETS_EMAIL: "abc@example.com"
       SECRETS_PASSWORD: "correcthorsebatterystaple"
     restart: unless-stopped
     depends_on:
       - rtdetr-api
+      - task-planner
     networks:
       - ai-net
 
@@ -103,3 +111,9 @@ services:
 networks:
   ai-net:
     driver: bridge
+
+volumes:
+  agent1_mozilla:
+  agent1_cache:
+  agent2_mozilla:
+  agent2_cache:

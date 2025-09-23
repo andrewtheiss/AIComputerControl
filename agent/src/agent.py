@@ -209,14 +209,30 @@ def send_keys(keys: List[str]):
         _safe_run(["xdotool", "key", k])
 
 def open_url(url: str):
-    # Prefer xdg-open fallback if firefox-esr not present
-    if which("firefox-esr"):
-        subprocess.Popen(["firefox-esr", "--new-window", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    elif which("xdg-open"):
-        subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    else:
-        # Last resort: try firefox
+    firefox_bin = os.environ.get("FIREFOX_BIN") or which("firefox-esr") or which("firefox")
+    if not firefox_bin:
+        if which("xdg-open"):
+            subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return
         subprocess.Popen(["firefox", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return
+
+    args = [firefox_bin]
+    profile = os.environ.get("FIREFOX_PROFILE_PATH", "").strip()
+    if profile:
+        # Auto-create the Firefox profile directory if missing (ESR sometimes requires it)
+        if not os.path.isdir(profile):
+            try:
+                subprocess.run(
+                    [firefox_bin, "-CreateProfile", f"agent {profile}"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False
+                )
+            except Exception:
+                pass
+        # Ensure we don't attach to an existing process and use the specified profile
+        args += ["--no-remote", "--new-instance", "--profile", profile]
+    args += ["--new-window", url]
+    subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 # -----------------------
 # LLM optional
@@ -959,12 +975,29 @@ class ActionExecutorDynamic:
         return {"status": "success", "var": save_as, "len": len(text)}
 
     def _action_open_url(self, url: str):
-        if which("firefox-esr"):
-            subprocess.Popen(["firefox-esr","--new-window",url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        elif which("xdg-open"):
-            subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        else:
+        firefox_bin = os.environ.get("FIREFOX_BIN") or which("firefox-esr") or which("firefox")
+        if not firefox_bin:
+            if which("xdg-open"):
+                subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return {"status": "success", "url": url, "launcher": "xdg-open"}
             subprocess.Popen(["firefox", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return {"status": "success", "url": url, "launcher": "firefox"}
+
+        args = [firefox_bin]
+        profile = os.environ.get("FIREFOX_PROFILE_PATH", "").strip()
+        if profile:
+            # Auto-create the Firefox profile directory if missing (ESR sometimes requires it)
+            if not os.path.isdir(profile):
+                try:
+                    subprocess.run(
+                        [firefox_bin, "-CreateProfile", f"agent {profile}"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False
+                    )
+                except Exception:
+                    pass
+            args += ["--no-remote", "--new-instance", "--profile", profile]
+        args += ["--new-window", url]
+        subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return {"status": "success", "url": url}
 
     # --- Planner request/response ---
