@@ -1,5 +1,8 @@
 # scripts/agent.py
 import os, re, time, json, threading, subprocess, io, uuid, shutil, traceback
+from ui_core import UIElement, Observation
+from perception import fuse_observation
+from decision import ComposeProposer, SendProposer, DismissModalProposer, arbitrate, Candidate
 from typing import Any, Dict, List, Optional, Tuple, Union
 from datetime import datetime
 
@@ -730,6 +733,108 @@ class ActionExecutorDynamic:
         line = safe_json_dumps(rec)
         print(line, flush=True)
 
+    def _apply_candidate(self, cand: Candidate) -> Dict[str,Any]:
+        if cand.action == "click_box":
+            self._capture_state()  # refresh last_img so to_abs works
+            x1,y1,x2,y2 = cand.params["box"]; cx,cy = (x1+x2)//2, (y1+y2)//2
+            x_abs,y_abs = self.grabber.to_abs(cx,cy)
+            if not CLICK_ENABLED or not self._xdotool_ok:
+                return {"status":"failure","error_code":"CLICK_DISABLED_OR_MISSING_XDOTOOL"}
+            _safe_run(["xdotool","mousemove","--sync",str(x_abs),str(y_abs)])
+            _safe_run(["xdotool","click","1"])
+            return {"status":"success","applied":"click_box","box":cand.params["box"],"why":cand.why}
+
+        if cand.action == "keys":
+            seq = self._normalize_key_sequence(cand.params.get("keys",[]))
+            for k in seq:
+                _safe_run(["xdotool","key","--clearmodifiers",k])
+            return {"status":"success","applied":"keys","keys":seq,"why":cand.why}
+
+        return {"status":"failure","error_code":"UNKNOWN_CAND_ACTION"}
+
+    # This is the heart of the "several opinions"
+    def _consensus_step(self, intent: str, verify_patterns: List[str], timeout_after_click: float = 2.0):
+        """
+        intent: "compose" | "send" | "dismiss" (extend freely)
+        verify_patterns: text regexes that must appear after a successful action.
+        """
+        # 1) Observe full perception (OCR + det + A11y if available)
+        img, _ = self.grabber.capture()
+        h, w = img.shape[:2]
+        ocr_min = [{"text": w["text"], "box": w["box"], "conf": w["conf"]} for w in self.last_ocr] if self.last_ocr else []
+        # Pull detections without overlay drawings
+        dets = []
+        try:
+            dets = rtdetr_detect(self.session, img, timeout=(2.0,4.0), retries=1)
+        except Exception:
+            pass
+        obs = fuse_observation(img_w=w, img_h=h, ocr_items=ocr_min, dets=dets, label_map=None)
+
+        # 2) Generate candidates from multiple proposers
+        proposers = []
+        if intent == "compose":
+            proposers = [ComposeProposer(), DismissModalProposer()]
+        elif intent == "send":
+            proposers = [SendProposer(), DismissModalProposer()]
+        else:
+            proposers = [DismissModalProposer()]
+
+        cands = []
+        for p in proposers:
+            cands.extend(p.propose(intent, obs))
+
+        # 3) Try in ranked order; verify each
+        for cand in arbitrate(cands, k=6):
+            applied = self._apply_candidate(cand)
+            self._log("info","consensus.try",{"intent": intent, "candidate": cand.__dict__, "result": applied})
+            if applied.get("status") != "success":
+                continue
+            # small wait for UI to react
+            self._action_sleep(timeout_after_click)
+            # verification
+            r = self._action_wait_any_text(verify_patterns, timeout_s=4)
+            if r.get("status") == "success":
+                return {"status": "success", "picked": cand.__dict__}
+        return {"status": "failure", "reason":"no candidate verified"}
+
+    def _detect_brittle_intent(self, action: str, params: Dict[str, Any]) -> Optional[Tuple[str, List[str]]]:
+        """
+        Detect planner-decided steps that are brittle (text/icon dependent) and
+        map them to a higher-level intent that can be handled by consensus.
+
+        Returns (intent, verify_patterns) or None if not applicable.
+        """
+        try:
+            # Normalize candidate patterns from params regardless of action flavor
+            patterns: List[str] = []
+            if action == "click_text" and isinstance(params.get("regex"), str):
+                patterns = [params.get("regex")]  # single regex
+            elif action == "click_any_text" and isinstance(params.get("patterns"), list):
+                patterns = [p for p in params.get("patterns") if isinstance(p, str)]
+            elif action == "click_near_text" and isinstance(params.get("anchor_regex"), str):
+                patterns = [params.get("anchor_regex")]  # anchor-based
+
+            # Intent: compose
+            compose_rx = re.compile(r"compose|new (mail|message)|write( message)?", re.I)
+            if patterns and any(compose_rx.search(p) for p in patterns):
+                return ("compose", [r"^To$", r"^Recipients?$", r"^Subject$"])
+
+            # Intent: send
+            send_rx = re.compile(r"^send( now| & archive)?$", re.I)
+            if patterns and any(send_rx.search(p) for p in patterns):
+                # Conservative verify: look for ephemeral sent toast or compose window closing cues
+                return ("send", [r"^Message sent", r"^Undo$", r"^Inbox$"])
+
+            # Keyboard-only intents
+            if action == "key_seq":
+                keys = params.get("keys", []) if isinstance(params.get("keys", []), list) else []
+                joined = ",".join([str(k) for k in keys]).lower()
+                if "ctrl+return" in joined or "ctrl+kp_enter" in joined:
+                    return ("send", [r"^Message sent", r"^Undo$", r"^Inbox$"])
+        except Exception:
+            pass
+        return None
+
     def _canonicalize_params(self, action: str, params: dict) -> dict:
         """Map common LLM synonyms to the executor's canonical arg names and drop unknowns."""
         p = dict(params or {})
@@ -1056,6 +1161,25 @@ class ActionExecutorDynamic:
             # 3) Act
             result = {"status":"failure","error_code":"UNKNOWN_ACTION","error_message": op}
             try:
+                # Intercept brittle planner steps with a consensus step first
+                brittle = self._detect_brittle_intent(op, params)
+                if brittle:
+                    intent, verify_patterns = brittle
+                    self._log("info","consensus.invoke", {"intent": intent, "verify": verify_patterns})
+                    res = self._consensus_step(intent=intent, verify_patterns=verify_patterns)
+                    if res.get("status") == "success":
+                        result = {"status":"success","via":"consensus","picked": res.get("picked")}
+                        # After success, optionally insert a short sleep to stabilize UI
+                        time.sleep(0.3)
+                        # record and continue to next loop without invoking the brittle action itself
+                        self.history.append({"action": f"consensus:{intent}", "parameters": {"verify": verify_patterns}, "result": result})
+                        self._log("info","action.result", {"action": f"consensus:{intent}", "result": result})
+                        step += 1
+                        time.sleep(0.6)
+                        continue
+                    else:
+                        self._log("warn","consensus.failed", {"intent": intent, "reason": res.get("reason")})
+
                 if op == "done" or op == "end_task":
                     self._log("info", "task.complete", {"reason": params.get("reason","planner requested end")})
                     break

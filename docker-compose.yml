@@ -82,6 +82,7 @@ services:
     depends_on:
       - rtdetr-api
       - task-planner
+      - ocr-api
     networks:
       - ai-net
 
@@ -113,6 +114,7 @@ services:
     depends_on:
       - rtdetr-api
       - task-planner
+      - ocr-api
     networks:
       - ai-net
 
