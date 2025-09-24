@@ -35,3 +35,10 @@ PY
 
 ## Step 2:
 2) Mount the host profile+cache into the container
+
+
+# Rebuilding this container:
+docker compose stop ocr-api
+docker compose build --no-cache ocr-api
+docker compose up -d --force-recreate --no-deps ocr-api
+docker compose logs -f ocr-api

@@ -8,7 +8,7 @@ import yaml
 import mss
 import cv2
 import numpy as np
-import pytesseract
+from ocr_client import OCRClient
 from rapidfuzz import fuzz, process as fuzz_process
 
 # -----------------------
@@ -23,7 +23,7 @@ MAX_STEPS        = int(os.environ.get("MAX_STEPS", "80"))
 HISTORY_WINDOW   = int(os.environ.get("HISTORY_WINDOW", "10"))
 OCR_LIMIT        = int(os.environ.get("OCR_LIMIT", "400"))     # cap tokens
 
-API_URL = os.environ.get("RTDETR_API_URL", "http://rtdetr-api:8000/predict")
+DETECT_API_URL = os.environ.get("DETECT_API_URL") or os.environ.get("RTDETR_API_URL", "http://rtdetr-api:8000/predict")
 AGENT_NAME = os.environ.get("AGENT_NAME", "agent-1")
 TASK_FILE = os.environ.get("AGENT_TASK", f"/tasks/{AGENT_NAME}.yaml")
 CLICK_ENABLED = os.environ.get("CLICK_ENABLED", "1") == "1"
@@ -91,23 +91,14 @@ class ScreenGrabber:
         return int(self.last_mon["left"] + x_rel), int(self.last_mon["top"] + y_rel)
 
 # -----------------------
-# OCR
+# OCR (HTTP-first with fallback)
 # -----------------------
+OCR_API_URL = os.environ.get("OCR_API_URL", "http://ocr-api:8020/ocr").strip()
+_ocr_client = OCRClient(url=OCR_API_URL, min_score=float(os.environ.get("OCR_MIN_SCORE", "0.45")))
+
 def ocr_image(image_bgr: np.ndarray) -> List[Dict[str, Any]]:
-    """Return OCR words with boxes: [{'text': str, 'box':[x1,y1,x2,y2], 'conf': float}]"""
-    rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-    data = pytesseract.image_to_data(rgb, output_type=pytesseract.Output.DICT)
-    out = []
-    for i in range(len(data["text"])):
-        txt = (data["text"][i] or "").strip()
-        if not txt:
-            continue
-        conf = float(data["conf"][i]) if data["conf"][i] != "-1" else 0.0
-        if conf < 50:  # basic quality gate
-            continue
-        x, y, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
-        out.append({"text": txt, "box": [x, y, x + w, y + h], "conf": conf})
-    return out
+    """Return OCR words with boxes using OCRClient (HTTP preferred, Tesseract fallback)."""
+    return _ocr_client.ocr(image_bgr)
 
 def _score_boldish_height(box: List[int]) -> int:
     return box[3] - box[1]
@@ -175,7 +166,7 @@ def rtdetr_detect(session: requests.Session, image_bgr: np.ndarray, timeout=(3.0
     last_err = None
     for attempt in range(retries + 1):
         try:
-            r = session.post(API_URL, files={"file": ("screen.jpg", jpg, "image/jpeg")}, timeout=timeout)
+            r = session.post(DETECT_API_URL, files={"file": ("screen.jpg", jpg, "image/jpeg")}, timeout=timeout)
             r.raise_for_status()
             return r.json().get("detections", [])
         except Exception as e:
@@ -206,7 +197,7 @@ def type_text(text: str):
 
 def send_keys(keys: List[str]):
     for k in keys:
-        _safe_run(["xdotool", "key", k])
+        _safe_run(["xdotool", "key", "--clearmodifiers", k])
 
 def open_url(url: str):
     firefox_bin = os.environ.get("FIREFOX_BIN") or which("firefox-esr") or which("firefox")
@@ -294,7 +285,7 @@ class TaskRunner:
         self._log(
             level="info",
             msg="agent.start",
-            extra={"agent": AGENT_NAME, "task_file": self.task_path, "api_url": API_URL, "click_enabled": CLICK_ENABLED,
+            extra={"agent": AGENT_NAME, "task_file": self.task_path, "api_url": DETECT_API_URL, "click_enabled": CLICK_ENABLED,
                    "screen_index": SCREEN_INDEX, "xdotool": self._xdotool_ok, "debug_dir": self.run_dir},
         )
 
@@ -572,7 +563,8 @@ class TaskRunner:
                                      fuzzy_text=_args.get("fuzzy_text"), fuzzy_threshold=_args.get("fuzzy_threshold"))
 
                 elif op == "type_text":
-                    s = sub_env(str(_args), self.ctx) if isinstance(args, str) else sub_env(_args.get("", "") or _args.get("text", ""), self.ctx)
+                    # _args is always a dict (strings normalized to {"value": ...})
+                    s = sub_env(_args.get("value") or _args.get("") or _args.get("text", ""), self.ctx)
                     type_text(s)
 
                 elif op == "key_seq":
@@ -754,7 +746,7 @@ class ActionExecutorDynamic:
             if "text" in p and "regex" not in p:
                 p["regex"] = p.pop("text")
             # keep only valid keys
-            allow = {"regex", "nth", "prefer_bold"}
+            allow = {"regex", "nth", "prefer_bold", "fuzzy_text", "fuzzy_threshold"}
             return {k: v for k, v in p.items() if k in allow}
 
         if action == "wait_text":
@@ -814,7 +806,7 @@ class ActionExecutorDynamic:
         self.last_img = img
         self.last_ocr = ocr_image(img)
         # truncate OCR to reduce token size (keep bigger words first)
-        self.last_ocr = sorted(self.last_ocr, key=lambda w: (-(w["box"][3]-w["box"][1]), -w["conf"]))[:OCR_LIMIT]
+        self.last_ocr = sorted(self.last_ocr, key=lambda w: (-(w["box"][3]-w["box"][1]), -float(w.get("conf", 100))))[:OCR_LIMIT]
         self._log("debug", "state.captured", {"ocr_items": len(self.last_ocr)})
 
     def _action_wait_any_text(self, patterns, timeout_s: int = 20):
@@ -877,10 +869,16 @@ class ActionExecutorDynamic:
         return {"status":"success","slept_seconds": float(seconds)}
 
     # --- Action impls (call your existing primitives) ---
-    def _action_click_text(self, regex: str, nth: int = 0, prefer_bold: bool = False):
+    from typing import Optional
+    def _action_click_text(
+        self,
+        regex: Optional[str] = None, nth: int = 0, prefer_bold: bool = False,
+        fuzzy_text: Optional[str] = None, fuzzy_threshold: Optional[float] = None
+    ):
         if not self.last_ocr:
             return {"status": "failure", "error_code": "NO_OCR", "error_message": "No OCR results yet"}
-        w = find_text_box(self.last_ocr, regex=regex, nth=nth, prefer_bold=prefer_bold)
+        w = find_text_box(self.last_ocr, regex=regex, nth=nth, prefer_bold=prefer_bold,
+                          fuzzy_text=fuzzy_text, fuzzy_threshold=fuzzy_threshold)
         if not w:
             return {"status": "failure", "error_code": "ELEMENT_NOT_FOUND",
                     "error_message": f"Regex '{regex}' not found"}

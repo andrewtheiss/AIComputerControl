@@ -1,5 +1,30 @@
 
 services:
+  ocr-api:
+    build: ./ocr
+    image: ai-ocr-ppocr
+    ports: ["8020:8020"]
+    environment:
+      - CUDA_VISIBLE_DEVICES=2
+      - NVIDIA_VISIBLE_DEVICES=2
+      - PP_OCR_DEVICE=gpu:0        # we'll read this in code (next step)
+      - OCR_BACKEND=ppocr
+      - PP_OCR_LANG=en
+      - PP_OCR_ENABLE_HPI=0          # try HPI on CUDA 12.6 (ORT GPU)
+      - PP_OCR_ORIENTATION=textline  # <-- exclusive choice (default)
+      - PP_OCR_LANG=en
+      - PP_OCR_DET_SIDE=1280
+      - PP_OCR_MODEL=ppocrv5_server
+      - UVICORN_WORKERS=1
+      
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+    networks: ["ai-net"]
+
+
   rtdetr-api:
     build:
       context: ./inference
@@ -50,7 +75,7 @@ services:
       # Explicitly set Firefox binary and profile (adjust profile dir name if different)
       FIREFOX_BIN: "/usr/bin/firefox-esr"
       FIREFOX_PROFILE_PATH: "/root/.mozilla/firefox/agent1.default-esr"
-      AGENT_GOAL: "Wait for Gmail to login and get to Inbox.  Once in inbox... Continually do the following: Compose emails to andrew.theiss@gmail.com and mention that his AI is working.  Send the email.  If not on the Compose Email Page, go back to Inbox.  Repeat 5 times.  Go to sent mail and verify the message was sent each time."
+      AGENT_GOAL: "Open Firefox and navigate to gmail.com. If not logged in, use generic login steps: find and click 'Sign in', enter username/email, password, and submit. Once in Gmail, repeat the following 5 times: Click 'Compose' or equivalent to start a new email. Confirm compose page loaded with wait for 'To' or 'Recipients'. Enter 'andrew.theiss@gmail.com' in To field. Set subject to 'Your AI is working successfully'. Add a simple body like 'Test email from automation'. Click 'Send'. If not on compose page after send, navigate back to Inbox via sidebar or button. After 5 sends, go to 'Sent' folder via sidebar, scroll/refresh if needed, and verify the 5 emails appear by checking for subjects via OCR. Handle any dialogs, captchas, or prompts by reading and clicking appropriate buttons (e.g., 'Continue', 'OK'). If impossible, stop"
       SECRETS_EMAIL: "abc@example.com"
       SECRETS_PASSWORD: "correcthorsebatterystaple"
     restart: unless-stopped
@@ -81,7 +106,7 @@ services:
       PLANNER_API_KEY: taskPlannerApiSecret
       FIREFOX_BIN: "/usr/bin/firefox-esr"
       FIREFOX_PROFILE_PATH: "/root/.mozilla/firefox/agent2.default-esr"
-      AGENT_GOAL: "Login to mail.com with user: ${SECRETS_EMAIL}, pass: ${SECRETS_PASSWORD}, then wait for Inbox"
+      AGENT_GOAL: "Open Firefox if not already. For each of 10 different websites (e.g., amazon.com, ebay.com, tcgplayer.com, walmart.com, target.com, bestbuy.com, pokemoncenter.com, cardkingdom.com, trollandtoad.com, coolstuffinc.com), do: Navigate to the site, use search bar to query 'pokemon booster box', wait for results page, scan via OCR for prices (look for '$' followed by numbers), note the lowest price found on that site. After all sites, compare the lowest prices collected. Use terminal (open if needed, type commands) to create/append to 'pokemon_price.txt' with the overall cheapest price, site, and date. Handle any popups, ads, or load issues by closing/refreshing; if a site blocks, skip and note. If file ops fail in one way, try text editor alternative like gedit to save the file."
       SECRETS_EMAIL: "abc@example.com"
       SECRETS_PASSWORD: "correcthorsebatterystaple"
     restart: unless-stopped

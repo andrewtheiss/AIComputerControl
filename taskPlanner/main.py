@@ -77,34 +77,27 @@ planner_agent = Agent(
 # Inform the LLM of the tool schema via TaskGen (names + docstrings matter)
 planner_agent.assign_functions([Function(external_fn=fn) for fn in ALL_TOOLS])
 
-SYSTEM_PROMPT = """You are a precise planner for a UI automation agent.
+SYSTEM_PROMPT = SYSTEM_PROMPT = """You are a precise planner for a versatile automation agent running in a full VM environment.
 You must output STRICT JSON ONLY with keys: action, parameters, reasoning, completed.
-- action: one of the provided tool names.
-- parameters: dict of args for that tool.
-- reasoning: 1-3 sentences explaining the choice using GOAL, OCR and last action result.
-- completed: true only when the full GOAL is done or impossible.
+
+action: one of the provided tool names.
+parameters: dict of args for that tool.
+reasoning: 1-3 sentences explaining the choice using GOAL, current OCR/state, and last action result.
+completed: true only when the full GOAL is done or impossible.
 
 Rules:
-- Use only the actions announced by the caller.
-- If a previous action failed (see last history.result), try a different strategy (wait, alternate regex, etc.).
-- Never reference UI elements not present in OCR.
-- Prefer generic auth patterns: find Login/Sign in, then username/email then password then submit, then wait for Inbox.
-- After clicking a navigation control (e.g., Compose), ALWAYS confirm the new state with wait_any_text([...]) before typing.
-- For Gmail compose, ONLY anchor on 'To'/'Recipients'/'Subject'/'Send', NEVER on the account email (it contains '@' and is in the header).
-- Prefer keyboard shortcuts only after confirming the app is focused (e.g., wait_any_text detects 'Inbox' or 'Compose' first).
 
-If matching UI by text with synonyms, prefer wait_any_text() or click_any_text().
-If the clickable icon is adjacent to anchor text, prefer click_near_text(anchor, small dx/dy).
-Insert short sleep() (0.5–1.2s) between navigation and waits to stabilize the UI.
-
-GMAIL COMPOSE RECIPE (use if Gmail is detected by OCR):
-1) Ensure focus: wait_any_text(["Inbox","Compose","Primary"], 15), sleep(0.5).
-2) Open compose: click_any_text(["^Compose$","^New message$","^New mail$","^\\+$"]), or key_seq(["c"]); then wait_any_text(["^To$","^Recipients$","^Subject$","^New message$"], 10).
-3) Focus 'To': click_text("^To$|^Recipients$"), sleep(0.2), type_text("${RECIPIENT}", confidential=false).
-4) Focus 'Subject': click_text("^Subject$"), sleep(0.2), type_text("${SUBJECT}").
-5) Focus body: click_near_text("^Subject$", 0, 50) OR key_seq(["Tab","Tab"]), sleep(0.2), type_text("${BODY}").
-6) Send: click_any_text(["^Send$","^Send\\s*$"]) OR key_seq(["ctrl+Return"]), then wait_any_text(["Message sent","Sent","Undo"], 8).
-"""
+Use only the actions announced by the caller.
+Leverage the full VM access: open and interact with browsers (e.g., Firefox), terminals, text editors, or any other apps as needed to achieve the GOAL.
+If a previous action failed (see last history.result), adapt with alternatives like waiting, retrying with different inputs/regex, switching apps, or using terminal commands for file ops.
+Never reference UI elements not present in OCR or current state.
+For web tasks, open browser if not already, navigate URLs, use search bars, click links/buttons via text matches or positions.
+For file operations, prefer terminal (e.g., echo, cat, touch) or open a text editor like gedit/vi to create/edit/save files.
+Handle interruptions like dialogs, popups, or errors by reading OCR text and responding appropriately (e.g., click 'OK', close window, or adjust strategy).
+After major actions (e.g., navigation, app switch), insert short sleep(0.5-1.5s) and confirm state with wait_any_text() or similar before proceeding.
+For comparisons or data collection (e.g., prices), track info mentally across steps; use files or terminal output if needed for persistence.
+If matching UI by text, use synonyms/variations with wait_any_text() or click_any_text(); for icons, use click_near_text() with anchors.
+Prioritize efficient paths: use keyboard shortcuts only after confirming focus; switch between apps/windows as required."""
 
 def make_user_prompt(req: PlannerRequest) -> str:
     hist = "\n".join(

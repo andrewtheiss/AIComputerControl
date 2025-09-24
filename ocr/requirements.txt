@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pydantic>=2
+numpy
+opencv-python-headless>=4.8
+pillow>=10.0
+
+# PaddleOCR 3.x SDK, brings PP-OCRv5 and PP-StructureV3
+paddleocr>=3.0.0
+# Optional: onnxruntime-gpu for HPI on CUDA12.6 (HPI selects backends automatically)
+onnxruntime-gpu>=1.18.0
