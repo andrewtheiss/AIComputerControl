@@ -1,7 +1,7 @@
 # agent/src/perception.py
 from __future__ import annotations
 from typing import List, Dict, Any, Optional
-from .ui_core import UIElement, Observation
+from ui_core import UIElement, Observation
 import requests
 import os
 

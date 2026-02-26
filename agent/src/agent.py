@@ -760,7 +760,7 @@ class ActionExecutorDynamic:
         """
         # 1) Observe full perception (OCR + det + A11y if available)
         img, _ = self.grabber.capture()
-        h, w = img.shape[:2]
+        img_h, img_w = img.shape[:2]
         ocr_min = [{"text": w["text"], "box": w["box"], "conf": w["conf"]} for w in self.last_ocr] if self.last_ocr else []
         # Pull detections without overlay drawings
         dets = []
@@ -768,7 +768,7 @@ class ActionExecutorDynamic:
             dets = rtdetr_detect(self.session, img, timeout=(2.0,4.0), retries=1)
         except Exception:
             pass
-        obs = fuse_observation(img_w=w, img_h=h, ocr_items=ocr_min, dets=dets, label_map=None)
+        obs = fuse_observation(img_w=img_w, img_h=img_h, ocr_items=ocr_min, dets=dets, label_map=None)
 
         # 2) Generate candidates from multiple proposers
         proposers = []

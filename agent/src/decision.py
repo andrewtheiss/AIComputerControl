@@ -135,5 +135,3 @@ class DismissModalProposer(BaseProposer):
         cands: List[Candidate] = []
         cands += self._add_clicks_for_texts(obs, pats, base_conf=0.45, why_label="dismiss")
         return cands
-
-If you don’t have the A11y bridge yet, A11Y_BRIDGE_URL stays empty and that path is a no‑op

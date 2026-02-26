@@ -2,7 +2,7 @@
 from __future__ import annotations
 from typing import List, Dict, Any
 import re
-from .ui_core import Observation
+from ui_core import Observation
 
 # simple patterns; extend freely
 MODAL_TERMS = [
