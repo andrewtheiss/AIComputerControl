@@ -11,6 +11,7 @@ import yaml
 import mss
 import cv2
 import numpy as np
+import base64
 from ocr_client import OCRClient
 from rapidfuzz import fuzz, process as fuzz_process
 
@@ -33,11 +34,17 @@ CLICK_ENABLED = os.environ.get("CLICK_ENABLED", "1") == "1"
 SCREEN_INDEX = int(os.environ.get("AGENT_SCREEN_INDEX", "1"))  # mss monitor index
 DEBUG_ENABLED = os.environ.get("AGENT_DEBUG", "1") == "1"
 DEBUG_DIR = os.environ.get("AGENT_DEBUG_DIR", "/tmp/agent-debug")
+CLICK_CROP_DEBUG = os.environ.get("AGENT_DUMP_CLICK_CROPS", "1") == "1"
 
-# Optional LLM (OpenAI-compatible or local): set LLM_API_URL + LLM_MODEL + LLM_API_KEY
-LLM_API_URL = os.environ.get("LLM_API_URL", "")
-LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")
-LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
+# Optional LLM (OpenAI-compatible or local)
+# Configure one of the following:
+# - LLM_API_URL: Either a full endpoint (…/v1/chat/completions or …/v1/responses) OR the base URL (…/v1)
+# - LLM_MODEL: Target model name (e.g., "qwen3.5" or vendor-specific alias)
+# - LLM_API_KEY: Optional bearer token if your server requires it
+LLM_API_URL = os.environ.get("LLM_API_URL", "http://127.0.0.1:1234/v1").strip()
+LLM_MODEL = os.environ.get("LLM_MODEL", "qwen3.5").strip()
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "").strip()
+LLM_API_MODE = os.environ.get("LLM_API_MODE", "auto").strip()  # "auto" | "responses" | "chat"
 
 # -----------------------
 # Utilities
@@ -229,27 +236,197 @@ def open_url(url: str):
     subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 # -----------------------
-# LLM optional
+# LLM helpers (OpenAI-compatible v1: responses or chat.completions)
+# -----------------------
+def _derive_endpoints(url: str) -> Tuple[str, str]:
+    """
+    Accept either a base URL (…/v1) or a full endpoint URL.
+    Return (responses_url, chat_url).
+    """
+    u = (url or "").rstrip("/")
+    if u.endswith("/responses"):
+        base = u[: -len("/responses")]
+        return u, f"{base}/chat/completions"
+    if u.endswith("/chat/completions"):
+        base = u[: -len("/chat/completions")]
+        return f"{base}/responses", u
+    # assume base …/v1
+    return f"{u}/responses", f"{u}/chat/completions"
+
+
+def _post_json(url: str, headers: Dict[str, str], body: Dict[str, Any], timeout=(5, 60)) -> Dict[str, Any]:
+    r = requests.post(url, headers=headers, json=body, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+
+def _extract_text_from_openai_like(resp: Dict[str, Any]) -> str:
+    """
+    Normalize textual output for both responses API and chat.completions.
+    """
+    # chat.completions shape
+    if "choices" in resp and resp.get("choices"):
+        try:
+            return resp["choices"][0]["message"]["content"] or ""
+        except Exception:
+            pass
+    # responses API variants
+    # Some servers expose "output_text"; others have "output" with text segments.
+    if "output_text" in resp and isinstance(resp["output_text"], str):
+        return resp["output_text"]
+    if "output" in resp and isinstance(resp["output"], list):
+        texts: List[str] = []
+        for item in resp["output"]:
+            # common shapes: {"type":"output_text", "text":"..."} or {"content":[{"type":"output_text","text":"..."}]}
+            if isinstance(item, dict):
+                if item.get("type") in ("message", "output_text") and isinstance(item.get("text"), str):
+                    texts.append(item["text"])
+                elif "content" in item and isinstance(item["content"], list):
+                    for c in item["content"]:
+                        if isinstance(c, dict) and c.get("type") in ("message", "output_text") and isinstance(c.get("text"), str):
+                            texts.append(c["text"])
+        if texts:
+            return "\n".join(t for t in texts if t)
+    # fallback to any string field named "content"
+    if isinstance(resp.get("content"), str):
+        return resp["content"]
+    return ""
+
+
+# -----------------------
+# LLM optional (text-only)
 # -----------------------
 def run_llm(system: str, prompt: str) -> str:
     if not LLM_API_URL:
         return "[LLM disabled] " + prompt[:300]
+
     headers = {"Content-Type": "application/json"}
     if LLM_API_KEY:
         headers["Authorization"] = f"Bearer {LLM_API_KEY}"
-    body = {
+
+    responses_url, chat_url = _derive_endpoints(LLM_API_URL)
+
+    # Build both request bodies
+    chat_body = {
         "model": LLM_MODEL,
-        "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ],
         "temperature": 0.2,
     }
-    try:
-        r = requests.post(LLM_API_URL, headers=headers, json=body, timeout=(5, 60))
-        r.raise_for_status()
-        j = r.json()
-        # OpenAI-compatible
-        return j["choices"][0]["message"]["content"]
-    except Exception as e:
-        return f"[LLM error: {e}] {prompt[:300]}"
+    responses_body = {
+        "model": LLM_MODEL,
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": f"{system}\n\n{prompt}"}
+                ],
+            }
+        ],
+        "temperature": 0.2,
+    }
+
+    # Try preferred mode first, then fallback
+    try_order: List[Tuple[str, Dict[str, Any]]] = []
+    mode = LLM_API_MODE.lower()
+    if mode == "responses":
+        try_order = [(responses_url, responses_body), (chat_url, chat_body)]
+    elif mode == "chat":
+        try_order = [(chat_url, chat_body), (responses_url, responses_body)]
+    else:
+        try_order = [(responses_url, responses_body), (chat_url, chat_body)]
+
+    last_err: Optional[Exception] = None
+    for url, body in try_order:
+        try:
+            j = _post_json(url, headers, body)
+            text = _extract_text_from_openai_like(j)
+            if text:
+                return text
+            # If empty, still return something useful
+            return json.dumps(j)[:2000]
+        except Exception as e:
+            last_err = e
+            continue
+    return f"[LLM error: {last_err}] {prompt[:300]}"
+
+
+# -----------------------
+# LLM vision (image + text → text)
+# -----------------------
+def run_llm_vision(image_bgr: np.ndarray, system: str, prompt: str) -> str:
+    """
+    Send a screenshot/image with text instructions to an OpenAI-compatible server.
+    Supports both /v1/responses and /v1/chat/completions formats.
+    """
+    if not LLM_API_URL:
+        return "[LLM disabled] " + prompt[:300]
+
+    headers = {"Content-Type": "application/json"}
+    if LLM_API_KEY:
+        headers["Authorization"] = f"Bearer {LLM_API_KEY}"
+
+    # Encode image to base64 data URL
+    jpg_bytes = encode_jpeg_bgr(image_bgr, q=90)
+    b64 = base64.b64encode(jpg_bytes).decode("ascii")
+    data_url = f"data:image/jpeg;base64,{b64}"
+
+    responses_url, chat_url = _derive_endpoints(LLM_API_URL)
+
+    # Chat Completions style (multi-part message content)
+    chat_body = {
+        "model": LLM_MODEL,
+        "messages": [
+            {"role": "system", "content": system},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            },
+        ],
+        "temperature": 0.2,
+    }
+
+    # Responses API style (input_text + input_image)
+    responses_body = {
+        "model": LLM_MODEL,
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": prompt},
+                    {"type": "input_image", "image_url": data_url},
+                ],
+            }
+        ],
+        "temperature": 0.2,
+    }
+
+    try_order: List[Tuple[str, Dict[str, Any]]] = []
+    mode = LLM_API_MODE.lower()
+    if mode == "responses":
+        try_order = [(responses_url, responses_body), (chat_url, chat_body)]
+    elif mode == "chat":
+        try_order = [(chat_url, chat_body), (responses_url, responses_body)]
+    else:
+        try_order = [(responses_url, responses_body), (chat_url, chat_body)]
+
+    last_err: Optional[Exception] = None
+    for url, body in try_order:
+        try:
+            j = _post_json(url, headers, body)
+            text = _extract_text_from_openai_like(j)
+            if text:
+                return text
+            return json.dumps(j)[:2000]
+        except Exception as e:
+            last_err = e
+            continue
+    return f"[LLM error: {last_err}] {prompt[:300]}"
 
 def sub_env(s: str, ctx: Dict[str, Any]) -> str:
     # ${VAR} from env or ctx
@@ -726,12 +903,80 @@ class ActionExecutorDynamic:
         self.last_ocr: List[Dict[str, Any]] = []
         self._xdotool_ok = which("xdotool") is not None
 
+        # Debug folder (persist crops/overlays if host mounts AGENT_DEBUG_DIR)
+        self.debug_enabled = DEBUG_ENABLED
+        self.run_id = datetime.utcnow().strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:8]
+        self.run_dir = os.path.join(DEBUG_DIR, f"{AGENT_NAME}-{self.run_id}")
+        if self.debug_enabled:
+            ensure_dir(self.run_dir)
+
     # --- Logging, capture, OCR ---
     def _log(self, level: str, msg: str, extra: Optional[Dict[str, Any]] = None):
         rec = {"ts": now_utc_iso(), "level": level, "msg": msg}
         if extra: rec.update(extra)
         line = safe_json_dumps(rec)
         print(line, flush=True)
+
+    def _debug_save_click_crop(
+        self,
+        *,
+        box: List[int],
+        click_rel: Tuple[int, int],
+        action: str,
+        note: Optional[str] = None,
+        pad: int = 60,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Save a cropped image around the intended click region, plus an overlay that
+        shows the box and the click point. This is the fastest way to diagnose
+        small systematic x/y offsets.
+        """
+        if not (self.debug_enabled and CLICK_CROP_DEBUG):
+            return None
+        if self.last_img is None:
+            return None
+        try:
+            x1, y1, x2, y2 = [int(v) for v in (box or [0, 0, 0, 0])]
+            cx, cy = int(click_rel[0]), int(click_rel[1])
+            h, w = self.last_img.shape[:2]
+            # Clamp crop bounds
+            left = max(0, min(w - 1, min(x1, x2) - pad))
+            top = max(0, min(h - 1, min(y1, y2) - pad))
+            right = max(1, min(w, max(x1, x2) + pad))
+            bottom = max(1, min(h, max(y1, y2) + pad))
+            if right <= left or bottom <= top:
+                return None
+
+            crop = self.last_img[top:bottom, left:right].copy()
+            overlay = crop.copy()
+            # Draw the original box and click point in crop coordinates
+            bx1, by1, bx2, by2 = x1 - left, y1 - top, x2 - left, y2 - top
+            px, py = cx - left, cy - top
+            cv2.rectangle(overlay, (bx1, by1), (bx2, by2), (0, 200, 0), 2)  # green box
+            cv2.circle(overlay, (px, py), 6, (0, 0, 255), -1)              # red dot
+            cv2.drawMarker(overlay, (px, py), (0, 0, 255), markerType=cv2.MARKER_CROSS, markerSize=18, thickness=2)
+
+            ts_ms = int(time.time() * 1000)
+            base = f"{ts_ms}_{action}"
+            raw_name = os.path.join(self.run_dir, f"{base}_crop.jpg")
+            ov_name = os.path.join(self.run_dir, f"{base}_crop_overlay.jpg")
+            cv2.imwrite(raw_name, crop)
+            cv2.imwrite(ov_name, overlay)
+
+            meta = {
+                "raw_path": raw_name,
+                "overlay_path": ov_name,
+                "action": action,
+                "note": note or "",
+                "box": [x1, y1, x2, y2],
+                "click_rel": [cx, cy],
+                "crop_bounds": [left, top, right, bottom],
+            }
+            self._log("info", "click.debug.crop_saved", meta)
+            return meta
+        except Exception as e:
+            self._log("warn", "click.debug.crop_failed", {"error": str(e), "action": action})
+            return None
 
     def _apply_candidate(self, cand: Candidate) -> Dict[str,Any]:
         if cand.action == "click_box":
@@ -879,6 +1124,12 @@ class ActionExecutorDynamic:
             allow = {"anchor_regex", "dx", "dy"}
             return {k: v for k, v in p.items() if k in allow}
 
+        if action == "click_box":
+            if "bbox" in p and "box" not in p:
+                p["box"] = p.pop("bbox")
+            allow = {"box"}
+            return {k: v for k, v in p.items() if k in allow}
+
         if action == "type_text":
             allow = {"text", "confidential"}
             return {k: v for k, v in p.items() if k in allow}
@@ -945,6 +1196,12 @@ class ActionExecutorDynamic:
             )
             if w:
                 x1,y1,x2,y2 = w["box"]; cx,cy = (x1+x2)//2, (y1+y2)//2
+                self._debug_save_click_crop(
+                    box=[int(x1), int(y1), int(x2), int(y2)],
+                    click_rel=(int(cx), int(cy)),
+                    action="click_any_text",
+                    note=f"pattern_used={pat}",
+                )
                 x_abs,y_abs = self.grabber.to_abs(cx,cy)
                 if not CLICK_ENABLED or not self._xdotool_ok:
                     return {"status":"failure","error_code":"CLICK_DISABLED_OR_MISSING_XDOTOOL"}
@@ -962,12 +1219,41 @@ class ActionExecutorDynamic:
         # Guard against header/account anchors (e.g., email in header)
         if "@" in w.get("text", "") and cy < 80:
             return {"status":"failure","error_code":"ANCHOR_REJECTED_HEADER","error_message": w.get("text", "")}
-        x_abs,y_abs = self.grabber.to_abs(cx+dx, cy+dy)
+        click_x, click_y = int(cx + dx), int(cy + dy)
+        # For near-text clicks, define a small box around the click point for cropping.
+        self._debug_save_click_crop(
+            box=[click_x - 12, click_y - 12, click_x + 12, click_y + 12],
+            click_rel=(click_x, click_y),
+            action="click_near_text",
+            note=f"anchor={w.get('text','')} offset=[{dx},{dy}]",
+        )
+        x_abs,y_abs = self.grabber.to_abs(click_x, click_y)
         if not CLICK_ENABLED or not self._xdotool_ok:
             return {"status":"failure","error_code":"CLICK_DISABLED_OR_MISSING_XDOTOOL"}
         _safe_run(["xdotool","mousemove","--sync",str(x_abs),str(y_abs)])
         _safe_run(["xdotool","click","1"])
         return {"status":"success","anchor": w["text"], "anchor_box": w["box"], "offset": [dx,dy]}
+
+    def _action_click_box(self, box):
+        try:
+            x1, y1, x2, y2 = [int(v) for v in (box or [0, 0, 0, 0])]
+        except Exception:
+            return {"status": "failure", "error_code": "BAD_BOX", "error_message": str(box)}
+        # Basic sanity check
+        if x2 <= x1 or y2 <= y1:
+            return {"status": "failure", "error_code": "BAD_BOX", "error_message": str(box)}
+        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+        self._debug_save_click_crop(
+            box=[x1, y1, x2, y2],
+            click_rel=(int(cx), int(cy)),
+            action="click_box",
+        )
+        x_abs, y_abs = self.grabber.to_abs(cx, cy)
+        if not CLICK_ENABLED or not self._xdotool_ok:
+            return {"status": "failure", "error_code": "CLICK_DISABLED_OR_MISSING_XDOTOOL"}
+        _safe_run(["xdotool", "mousemove", "--sync", str(x_abs), str(y_abs)])
+        _safe_run(["xdotool", "click", "1"])
+        return {"status": "success", "box": [x1, y1, x2, y2], "clicked_abs": [x_abs, y_abs]}
 
     def _action_sleep(self, seconds: float = 0.8):
         time.sleep(float(seconds))
@@ -1136,16 +1422,79 @@ class ActionExecutorDynamic:
             ocr_min = [{"text": w["text"], "box": w["box"], "conf": w["conf"]} for w in self.last_ocr]
 
             # 2) Report
+            # Optionally attach a compressed screenshot so the planner can use a vision model.
+            # Keep payload bounded to avoid ballooning latency/tokens.
+            screenshot_b64 = None
+            screenshot_mime = "image/jpeg"
+            ui_elements: List[Dict[str, Any]] = []
+            try:
+                if os.environ.get("PLANNER_SEND_SCREENSHOT", "1").strip() != "0" and self.last_img is not None:
+                    q = int(os.environ.get("PLANNER_SCREENSHOT_JPEG_QUALITY", "60"))
+                    q = max(25, min(90, q))
+                    jpg = encode_jpeg_bgr(self.last_img, q=q)
+                    screenshot_b64 = base64.b64encode(jpg).decode("ascii")
+            except Exception as e:
+                self._log("warn", "planner.screenshot.encode_failed", {"error": str(e)})
+
+            try:
+                # OCR elements (boxes are image-relative)
+                max_ocr_elems = int(os.environ.get("PLANNER_MAX_OCR_ELEMENTS", "200"))
+                max_ocr_elems = max(0, min(400, max_ocr_elems))
+                for w in self.last_ocr[:max_ocr_elems]:
+                    ui_elements.append({
+                        "source": "ocr",
+                        "text": w.get("text", ""),
+                        "box": w.get("box", [0, 0, 0, 0]),
+                        "score": float(w.get("conf", 0.0)) / 100.0 if float(w.get("conf", 0.0)) > 1.0 else float(w.get("conf", 0.0)),
+                        "role": None,
+                    })
+
+                # Optional detections (icon-only affordances). Disabled by default.
+                if os.environ.get("PLANNER_SEND_DETECTIONS", "0").strip() == "1" and self.last_img is not None:
+                    max_det = int(os.environ.get("PLANNER_MAX_DETECTIONS", "60"))
+                    max_det = max(0, min(200, max_det))
+                    dets = rtdetr_detect(self.session, self.last_img, timeout=(2.0, 4.0), retries=1) or []
+                    dets = sorted(dets, key=lambda d: -float(d.get("score", 0.0)))[:max_det]
+                    for d in dets:
+                        ui_elements.append({
+                            "source": "det",
+                            "text": f"label:{int(d.get('label', -1))}",
+                            "box": d.get("box", [0, 0, 0, 0]),
+                            "score": float(d.get("score", 0.0)),
+                            "role": None,
+                        })
+            except Exception as e:
+                self._log("warn", "planner.ui_elements.build_failed", {"error": str(e)})
+
             payload = {
                 "goal": AGENT_GOAL,
                 "task_history": self.history[-HISTORY_WINDOW:],
                 "ocr_results": ocr_min,
+                "ui_elements": ui_elements,
+                "screenshot_b64": screenshot_b64,
+                "screenshot_mime": screenshot_mime,
                 "available_actions": [
                     "open_url","wait_text","wait_any_text",
-                    "click_text","click_any_text","click_near_text",
+                    "click_text","click_any_text","click_near_text","click_box",
                     "type_text","key_seq","sleep","ocr_extract","end_task"
                 ]
             }
+
+            if os.environ.get("AGENT_LOG_PLANNER_SUMMARY", "1").strip() == "1":
+                self._log(
+                    "info",
+                    "planner.payload.summary",
+                    {
+                        "step": step,
+                        "goal_len": len(AGENT_GOAL or ""),
+                        "task_history_n": len(payload.get("task_history") or []),
+                        "ocr_results_n": len(payload.get("ocr_results") or []),
+                        "ui_elements_n": len(payload.get("ui_elements") or []),
+                        "has_screenshot": bool(payload.get("screenshot_b64")),
+                        "screenshot_b64_len": len(payload.get("screenshot_b64") or "") if payload.get("screenshot_b64") else 0,
+                        "available_actions_n": len(payload.get("available_actions") or []),
+                    },
+                )
             resp = self._post_to_planner(payload)
             if not resp:
                 time.sleep(2)
@@ -1189,6 +1538,7 @@ class ActionExecutorDynamic:
                 elif op == "click_text":     result = self._action_click_text(**params)
                 elif op == "click_any_text": result = self._action_click_any_text(**params)
                 elif op == "click_near_text":result = self._action_click_near_text(**params)
+                elif op == "click_box":      result = self._action_click_box(**params)
                 elif op == "type_text":      result = self._action_type_text(**params)
                 elif op == "key_seq":        result = self._action_key_seq(**params)
                 elif op == "sleep":          result = self._action_sleep(**params)

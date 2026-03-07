@@ -3,7 +3,6 @@ services:
   ocr-api:
     build: ./ocr
     image: ai-ocr-ppocr
-    ports: ["8020:8020"]
     environment:
       - CUDA_VISIBLE_DEVICES=2
       - NVIDIA_VISIBLE_DEVICES=2
@@ -32,8 +31,6 @@ services:
     image: rtdetr-api:latest
     container_name: rtdetr-api
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
-    ports:
-      - "8000:8000"
     gpus:
       - device_ids: ["1"]
         capabilities: ["gpu"]
@@ -56,9 +53,10 @@ services:
       dockerfile: Dockerfile
     container_name: vnc-instance-1
     ports:
-      - "5901:5901"
+      - "25901:5901"
     volumes:
       - ./tasks:/tasks:rw
+      - ./agent-debug:/tmp/agent-debug:rw
       # Mount host Firefox Snap profile and cache into container
       - /home/theiss/snap/firefox/common/.mozilla:/root/.mozilla:rw
       - /home/theiss/snap/firefox/common/.cache/mozilla:/root/.cache/mozilla:rw
@@ -90,9 +88,10 @@ services:
     image: ai-sandbox
     container_name: vnc-instance-2
     ports:
-      - "5902:5901"
+      - "25902:5901"
     volumes:
       - ./tasks:/tasks:rw
+      - ./agent-debug:/tmp/agent-debug:rw
       - ./profiles/agent-2/.mozilla:/root/.mozilla:rw
       - ./profiles/agent-2/.cache/mozilla:/root/.cache/mozilla:rw
     gpus:
@@ -124,11 +123,16 @@ services:
       dockerfile: Dockerfile
     container_name: task-planner
     ports:
-      - "8010:8000"
+      - "28000:8000"
+    volumes:
+      - ./planner-dumps:/dumps:rw
     environment:
       PLANNER_API_KEY: taskPlannerApiSecret
-      OLLAMA_OPENAI_BASE: http://host.docker.internal:11434/v1
-      OLLAMA_MODEL: gpt-oss:120b
+      OLLAMA_OPENAI_BASE: http://host.docker.internal:1234/v1
+      OLLAMA_MODEL: qwen3.5
+      PLANNER_LOG_REQUESTS: "1"
+      PLANNER_DUMP_REQUESTS_DIR: "/dumps"
+      PLANNER_DUMP_MAX_FILES: "200"
     # map host.docker.internal on Linux (Desktop already provides it)
     extra_hosts:
       - "host.docker.internal:host-gateway"

@@ -88,7 +88,7 @@ Agent container and desktop:
 - Dockerfile installs XFCE, TigerVNC, Firefox-ESR, `xdotool`, Tesseract, and Python deps.
 - VNC password is pre-generated on host and copied into the image (`agent/passwd`).
 - On container start, VNC launches display `:1`, starts XFCE, and runs `agent.py`.
-- Connect to the agent via VNC on the mapped host port (e.g., `localhost:5901`).
+- Connect to the agent via VNC on the mapped host port (default compose uses `localhost:25901` and `localhost:25902`).
 
 ### Task Planner (`taskPlanner/`)
 - Entrypoint: `main.py` (FastAPI) exposes `POST /v1/actions/next`.
@@ -107,14 +107,14 @@ Planner environment:
 ---
 
 ## Orchestration (`docker-compose.yml`)
-- `rtdetr-api` (GPU 1 by example): builds from `inference/`, exposes `8000:8000`, sets `ENGINE_PATH`, `NVIDIA_*` envs, and ulimits. Network: `ai-net`.
-- `vnc-instance-1` and `vnc-instance-2` (GPU 0): build from `agent/` (image `ai-sandbox`), expose VNC ports (`5901`, `5902`), mount `./tasks` into `/tasks`, and mount host Firefox profile/cache to persist cookies and session data. Key env:
+- `rtdetr-api` (GPU 1 by example): builds from `inference/`, does NOT expose a host port by default (reachable as `http://rtdetr-api:8000` from other services), sets `ENGINE_PATH`, `NVIDIA_*` envs, and ulimits. Network: `ai-net`.
+- `vnc-instance-1` and `vnc-instance-2` (GPU 0): build from `agent/` (image `ai-sandbox`), expose VNC ports (`25901`, `25902`) on the host to avoid collisions, mount `./tasks` into `/tasks`, and mount host Firefox profile/cache to persist cookies and session data. Key env:
   - `AGENT_MODE=dynamic`
   - `RTDETR_API_URL` → `http://rtdetr-api:8000/predict`
   - `TASK_PLANNER_URL` → `http://task-planner:8000/v1/actions/next`
   - `PLANNER_API_KEY`, `FIREFOX_BIN`, `FIREFOX_PROFILE_PATH`, `AGENT_GOAL`, login secrets
   - `depends_on`: `rtdetr-api`, `task-planner`
-- `task-planner`: builds from `taskPlanner/`, exposes `8010:8000`, configured to reach Ollama at `host.docker.internal:11434` with `extra_hosts` for Linux compatibility.
+- `task-planner`: builds from `taskPlanner/`, does NOT expose a host port by default (reachable as `http://task-planner:8000` from other services). It is configured to reach the local model server at `host.docker.internal:1234/v1` with `extra_hosts` for Linux compatibility.
 - Shared bridge network `ai-net` connects all services by name (service DNS).
 
 GPU notes: `device_ids` select GPUs per service. Adjust per your hardware. The compose file shows an example split (planner CPU-only; inference on GPU 1; agents on GPU 0 for xdotool and desktop rendering).
@@ -207,8 +207,8 @@ docker compose up --build -d
 ```
 
 Connect to agents:
-- `vnc-instance-1` → `localhost:5901`
-- `vnc-instance-2` → `localhost:5902`
+- `vnc-instance-1` → `localhost:25901`
+- `vnc-instance-2` → `localhost:25902`
 
 Scale agents:
 ```bash
@@ -234,7 +234,9 @@ docker compose down
 ## Testing and Utilities
 
 ### Inference API test
-`test/test_client.py` posts `test/test.jpg` to `http://localhost:8000/predict` and prints the JSON response.
+By default `rtdetr-api` is not exposed on the host. To test from the host, either:
+- Temporarily expose a port in `docker-compose.yml` (e.g., add `ports: ["8021:8000"]` under `rtdetr-api`) and POST to `http://localhost:8021/predict`, or
+- Exec into an agent container and call `http://rtdetr-api:8000/predict` over the internal network.
 
 ### Mock inference server (Triton gRPC)
 `tools/mock_inference_server/` contains a small GRPC service that mocks Triton’s `ModelInfer`. This is not used by the main application (which uses HTTP FastAPI), but can be repurposed if you move to Triton GRPC.

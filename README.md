@@ -62,7 +62,7 @@ docker-compose up --build -d
 
 Use your VNC Viewer to connect to the agent instances. By default, the first agent is available at:
 
--   **Address:** `localhost:5901`
+-   **Address:** `localhost:25901` (compose default; avoids common collisions)
 -   **Password:** The password you created during the one-time setup.
 
 #### Scale the Number of Agents
@@ -72,7 +72,7 @@ To run multiple agents, use the `--scale` flag. For example, to run 3 agents:
 ```bash
 docker-compose up --build -d --scale agent=3
 ```
-Docker Compose will automatically manage ports and naming. You can connect to them at `localhost:5901`, `localhost:5902`, `localhost:5903`, etc.
+This compose defines two named agents with fixed, high host ports: `localhost:25901` and `localhost:25902`. If you add more agents, assign additional high ports or use `docker compose port <service> 5901` to discover the mapped port.
 
 #### View Logs
 

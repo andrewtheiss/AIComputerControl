@@ -1,10 +1,16 @@
 # task_planner/main.py
 import os, json
 import orjson
+import logging
+import base64
+import time
+import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 from dataclasses import dataclass
 
 from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi import Request
 from pydantic import BaseModel, Field, ConfigDict
 from dotenv import load_dotenv
 from tenacity import retry, wait_exponential, stop_after_attempt
@@ -15,10 +21,26 @@ from tools import ALL_TOOLS
 
 load_dotenv()
 
-# --- Ollama (OpenAI-compatible) client ---
-OLLAMA_OPENAI_BASE = os.getenv("OLLAMA_OPENAI_BASE", "http://host.docker.internal:11434/v1")
-OLLAMA_MODEL       = os.getenv("OLLAMA_MODEL", "llama3")
-OPENAI_DUMMY_KEY   = os.getenv("OPENAI_API_KEY", "ollama")  # not used by Ollama, but OpenAI client requires it
+# --- Logging ---
+LOG_LEVEL = os.getenv("PLANNER_LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
+logger = logging.getLogger("task-planner")
+
+LOG_REQUESTS = os.getenv("PLANNER_LOG_REQUESTS", "0").strip() == "1"
+LOG_DECISIONS = os.getenv("PLANNER_LOG_DECISIONS", "1").strip() == "1"
+LOG_LLM_PROMPT = os.getenv("PLANNER_LOG_LLM_PROMPT", "0").strip() == "1"   # may include OCR/history
+LOG_LLM_OUTPUT = os.getenv("PLANNER_LOG_LLM_OUTPUT", "0").strip() == "1"   # raw model text (truncated)
+LOG_TRUNC_CHARS = int(os.getenv("PLANNER_LOG_TRUNC_CHARS", "1200"))
+
+# Optional request dumping (sanitized JSON + decoded screenshot file)
+DUMP_DIR = os.getenv("PLANNER_DUMP_REQUESTS_DIR", "").strip()
+MAX_DUMPS = int(os.getenv("PLANNER_DUMP_MAX_FILES", "200"))
+
+# --- OpenAI-compatible client (local or remote) ---
+# Point to your server base (e.g., http://127.0.0.1:1234/v1) and model (e.g., qwen3.5)
+OLLAMA_OPENAI_BASE = os.getenv("OLLAMA_OPENAI_BASE", "http://127.0.0.1:1234/v1")
+OLLAMA_MODEL       = os.getenv("OLLAMA_MODEL", "qwen3.5")
+OPENAI_DUMMY_KEY   = os.getenv("OPENAI_API_KEY", "local")  # many local servers ignore the key but SDK requires it
 client = AsyncOpenAI(base_url=OLLAMA_OPENAI_BASE, api_key=OPENAI_DUMMY_KEY)
 
 PLANNER_API_KEY = os.getenv("PLANNER_API_KEY", "")
@@ -43,10 +65,24 @@ class HistoryItem(BaseModel):
     parameters: Dict[str, Any]
     result: Dict[str, Any]
 
+class UIElement(BaseModel):
+    """
+    A compact, screen-space UI element description produced by the executor.
+    Coordinates are image-relative [x1,y1,x2,y2] for the current screenshot frame.
+    """
+    source: str  # "ocr" | "det" | "ax"
+    text: str
+    box: List[int]
+    score: float
+    role: Optional[str] = None
+
 class PlannerRequest(BaseModel):
     goal: str
     task_history: List[HistoryItem] = Field(default_factory=list)
     ocr_results: List[OCRResult] = Field(default_factory=list)
+    ui_elements: List[UIElement] = Field(default_factory=list)
+    screenshot_b64: Optional[str] = None
+    screenshot_mime: str = "image/jpeg"
     available_actions: List[str] = Field(default_factory=list)
 
 class PlannerResponse(BaseModel):
@@ -99,22 +135,201 @@ For comparisons or data collection (e.g., prices), track info mentally across st
 If matching UI by text, use synonyms/variations with wait_any_text() or click_any_text(); for icons, use click_near_text() with anchors.
 Prioritize efficient paths: use keyboard shortcuts only after confirming focus; switch between apps/windows as required."""
 
+def _tool_specs_for_actions(actions: List[str]) -> str:
+    """
+    Build a compact tool spec block from docstrings in tools.py for ONLY the
+    actions announced by the caller, to reduce hallucinated parameters.
+    """
+    want = set(actions or [])
+    blocks: List[str] = []
+    for fn in ALL_TOOLS:
+        name = getattr(fn, "__name__", "")
+        if name and name in want:
+            doc = (getattr(fn, "__doc__", "") or "").strip()
+            if doc:
+                blocks.append(f"## {name}\n{doc}")
+            else:
+                blocks.append(f"## {name}\n(No docstring.)")
+    return "\n\n".join(blocks) if blocks else "(No tool specs available.)"
+
 def make_user_prompt(req: PlannerRequest) -> str:
     hist = "\n".join(
         f"- {h.action}({h.parameters}) => {h.result.get('status')}"
         for h in req.task_history[-5:]
     ) or "No prior actions."
     ocr = "\n".join(f"- {r.text} @ {r.box} (conf={int(r.conf)})" for r in req.ocr_results[:300]) or "No OCR text."
+    elems = "\n".join(
+        f"- [{e.source}{'/' + e.role if e.role else ''}] {e.text} @ {e.box} (score={e.score:.2f})"
+        for e in req.ui_elements[:200]
+    ) or "No UI elements."
     actions = ", ".join(req.available_actions) or "[]"
+    tool_specs = _tool_specs_for_actions(req.available_actions)
+    has_shot = "yes" if (req.screenshot_b64 and str(req.screenshot_b64).strip()) else "no"
     return (
         f"GOAL:\n{req.goal}\n\n"
         f"AVAILABLE_ACTIONS: {actions}\n\n"
+        f"HAS_SCREENSHOT: {has_shot}\n\n"
         f"RECENT_HISTORY:\n{hist}\n\n"
         f"CURRENT_OCR:\n{ocr}\n\n"
+        f"UI_ELEMENTS (image-relative boxes):\n{elems}\n\n"
+        f"TOOL_SPECS:\n{tool_specs}\n\n"
         f"Return strict JSON only."
     )
 
 app = FastAPI(title="TaskPlanner API", version="1.0.0")
+
+@app.middleware("http")
+async def log_planner_requests(request: Request, call_next):
+    """
+    Optional request logging for /v1/actions/next. By default, logs only a safe
+    summary (counts + screenshot sizes) and never logs screenshot contents.
+    Enable with PLANNER_LOG_REQUESTS=1.
+    """
+    if request.url.path == "/v1/actions/next" and LOG_REQUESTS:
+        try:
+            body = await request.body()
+            # Ensure downstream can still read the body (FastAPI dependencies / parsing).
+            request._body = body  # type: ignore[attr-defined]
+
+            summary: Dict[str, Any] = {"bytes": len(body)}
+            try:
+                obj = json.loads(body.decode("utf-8", errors="replace"))
+                shot = (obj.get("screenshot_b64") or "")
+                summary.update({
+                    "goal_len": len(obj.get("goal") or ""),
+                    "task_history_n": len(obj.get("task_history") or []),
+                    "ocr_results_n": len(obj.get("ocr_results") or []),
+                    "ui_elements_n": len(obj.get("ui_elements") or []),
+                    "available_actions_n": len(obj.get("available_actions") or []),
+                    "has_screenshot": bool(shot.strip()),
+                    "screenshot_b64_len": len(shot) if isinstance(shot, str) else None,
+                    "screenshot_mime": obj.get("screenshot_mime"),
+                })
+
+                # Optional dump to disk for replay debugging.
+                if DUMP_DIR:
+                    dump_dir = Path(DUMP_DIR)
+                    dump_dir.mkdir(parents=True, exist_ok=True)
+                    ts_ms = int(time.time() * 1000)
+                    rid = uuid.uuid4().hex[:10]
+                    base = dump_dir / f"{ts_ms}_{rid}"
+
+                    # Save decoded screenshot to file (if present).
+                    screenshot_path = None
+                    if isinstance(shot, str) and shot.strip():
+                        try:
+                            data_url = shot.strip()
+                            mime = (obj.get("screenshot_mime") or "image/jpeg").strip() or "image/jpeg"
+                            b64_part = data_url
+                            if data_url.startswith("data:"):
+                                # data:<mime>;base64,<b64>
+                                comma = data_url.find(",")
+                                b64_part = data_url[comma + 1 :] if comma != -1 else ""
+                            img_bytes = base64.b64decode(b64_part, validate=False)
+                            ext = ".jpg" if "jpeg" in mime or "jpg" in mime else ".png" if "png" in mime else ".img"
+                            screenshot_path = str(base.with_suffix(ext).name)
+                            (base.with_suffix(ext)).write_bytes(img_bytes)
+                        except Exception as e:
+                            logger.warning("planner.dump_screenshot_failed %s", {"error": str(e)})
+
+                    # Write a sanitized JSON (no base64 inline).
+                    obj_san = dict(obj)
+                    if screenshot_path:
+                        obj_san["screenshot_path"] = screenshot_path
+                    obj_san["screenshot_b64"] = None
+                    (base.with_suffix(".json")).write_text(json.dumps(obj_san, indent=2), encoding="utf-8")
+
+                    # Best-effort cleanup of oldest dumps.
+                    try:
+                        if MAX_DUMPS > 0:
+                            files = sorted(dump_dir.glob("*"), key=lambda p: p.stat().st_mtime)
+                            if len(files) > MAX_DUMPS:
+                                for p in files[: max(0, len(files) - MAX_DUMPS)]:
+                                    try:
+                                        p.unlink()
+                                    except Exception:
+                                        pass
+                    except Exception:
+                        pass
+            except Exception as e:
+                summary["json_parse_error"] = str(e)
+
+            client_ip = getattr(getattr(request, "client", None), "host", None)
+            if client_ip:
+                summary["client_ip"] = client_ip
+            logger.info("planner.request %s", summary)
+        except Exception as e:
+            logger.warning("planner.request_log_failed %s", {"error": str(e)})
+
+    return await call_next(request)
+
+def _data_url_from_b64(b64_or_data_url: str, mime: str) -> str:
+    s = (b64_or_data_url or "").strip()
+    if not s:
+        return ""
+    if s.startswith("data:"):
+        return s
+    m = (mime or "image/jpeg").strip() or "image/jpeg"
+    return f"data:{m};base64,{s}"
+
+async def call_planner_llm(req: PlannerRequest, system_prompt: str) -> str:
+    """
+    Call the OpenAI-compatible backend. If a screenshot is provided, use the
+    multimodal chat.completions message format (text + image_url). If the backend
+    rejects multimodal, fall back to text-only.
+    """
+    t0 = time.time()
+    user_prompt = make_user_prompt(req)
+    if LOG_LLM_PROMPT:
+        logger.info(
+            "planner.user_prompt %s",
+            {
+                "chars": len(user_prompt),
+                "trunc": user_prompt[:LOG_TRUNC_CHARS],
+            },
+        )
+
+    if req.screenshot_b64 and str(req.screenshot_b64).strip():
+        data_url = _data_url_from_b64(req.screenshot_b64, req.screenshot_mime)
+        try:
+            logger.info("planner.llm_call %s", {"multimodal": True, "model": OLLAMA_MODEL})
+            resp = await client.chat.completions.create(
+                model=OLLAMA_MODEL,
+                temperature=0.2,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": user_prompt},
+                            {"type": "image_url", "image_url": {"url": data_url}},
+                        ],
+                    },
+                ],
+            )
+            out = resp.choices[0].message.content or ""
+            logger.info("planner.llm_done %s", {"multimodal": True, "model": OLLAMA_MODEL, "elapsed_ms": int((time.time() - t0) * 1000), "out_chars": len(out)})
+            if LOG_LLM_OUTPUT:
+                logger.info("planner.llm_output %s", {"trunc": out[:LOG_TRUNC_CHARS]})
+            return out
+        except Exception:
+            # fall back to text-only below
+            pass
+
+    logger.info("planner.llm_call %s", {"multimodal": False, "model": OLLAMA_MODEL})
+    resp = await client.chat.completions.create(
+        model=OLLAMA_MODEL,
+        temperature=0.2,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    )
+    out = resp.choices[0].message.content or ""
+    logger.info("planner.llm_done %s", {"multimodal": False, "model": OLLAMA_MODEL, "elapsed_ms": int((time.time() - t0) * 1000), "out_chars": len(out)})
+    if LOG_LLM_OUTPUT:
+        logger.info("planner.llm_output %s", {"trunc": out[:LOG_TRUNC_CHARS]})
+    return out
 
 def normalize_params(action: str, params: Dict[str, Any]) -> Dict[str, Any]:
     p = dict(params or {})
@@ -126,12 +341,13 @@ def normalize_params(action: str, params: Dict[str, Any]) -> Dict[str, Any]:
         p["patterns"] = p.pop("texts")
     if action == "click_near_text" and "anchor" in p and "anchor_regex" not in p:
         p["anchor_regex"] = p.pop("anchor")
+    if action == "click_box" and "bbox" in p and "box" not in p:
+        p["box"] = p.pop("bbox")
     return p
 
 @retry(wait=wait_exponential(min=0.5, max=4), stop=stop_after_attempt(3))
 async def _decide(req: PlannerRequest) -> PlannerResponse:
-    user_prompt = make_user_prompt(req)
-    out = await planner_agent.llm(user_prompt, SYSTEM_PROMPT)
+    out = await call_planner_llm(req, SYSTEM_PROMPT)
 
     # Attempt strict JSON parse; if not JSON, try to extract a JSON object
     try:
@@ -147,9 +363,10 @@ async def _decide(req: PlannerRequest) -> PlannerResponse:
                    "completed": True}
 
     # Validate action
-    if obj.get("action") not in req.available_actions:
+    invalid_action = obj.get("action")
+    if invalid_action not in req.available_actions:
         obj = {"action":"end_task",
-               "parameters":{"reason":f"Invalid action {obj.get('action')}"},
+               "parameters":{"reason":f"Invalid action {invalid_action}"},
                "reasoning":"Planner filtered to safe action set",
                "completed": True}
 
@@ -157,7 +374,22 @@ async def _decide(req: PlannerRequest) -> PlannerResponse:
     act = obj.get("action")
     obj["parameters"] = normalize_params(act, obj.get("parameters", {}))
 
-    return PlannerResponse(**obj)
+    resp = PlannerResponse(**obj)
+    if LOG_DECISIONS:
+        logger.info(
+            "planner.decision %s",
+            {
+                "action": resp.action,
+                "parameters": resp.parameters,
+                "completed": resp.completed,
+                "reasoning_trunc": (resp.reasoning or "")[:400],
+                "has_screenshot": bool((req.screenshot_b64 or "").strip()),
+                "ocr_results_n": len(req.ocr_results or []),
+                "ui_elements_n": len(req.ui_elements or []),
+                "available_actions_n": len(req.available_actions or []),
+            },
+        )
+    return resp
 
 @app.post("/v1/actions/next", response_model=PlannerResponse, dependencies=[Depends(verify_key)])
 async def next_action(req: PlannerRequest):

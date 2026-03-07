@@ -93,6 +93,20 @@ def click_near_text(anchor_regex: str, dx: int = 0, dy: int = 0) -> str:
     """
     ...
 
+def click_box(box: List[int]) -> str:
+    """
+    Click the center of an image-relative bounding box.
+
+    Args:
+      box: [x1,y1,x2,y2] relative to the current screenshot frame.
+
+    Notes:
+      - Use this for icon-only controls or elements seen in the screenshot/detections
+        that have no reliable OCR text anchor.
+      - Prefer click_text/click_any_text when a stable label exists.
+    """
+    ...
+
 def type_text(text: str, confidential: bool = False) -> str:
     """
     Type text into the currently focused field.
@@ -172,6 +186,7 @@ ALL_TOOLS = [
     click_text,
     click_any_text,
     click_near_text,
+    click_box,
     type_text,
     key_seq,
     sleep,

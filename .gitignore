@@ -1,2 +1,6 @@
 
 *.Identifier
+
+planner-dumps/
+agent-debug/
+planner_payload.json

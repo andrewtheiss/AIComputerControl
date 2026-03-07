@@ -6,4 +6,5 @@ pydantic>=2.6
 python-dotenv
 orjson
 tenacity
+langchain-text-splitters
 
