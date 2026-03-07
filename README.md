@@ -143,4 +143,7 @@ docker cp vnc-instance-1:/root/.mozilla ./profiles/agent-1/.mozilla
 docker cp vnc-instance-1:/root/.cache/mozilla ./profiles/agent-1/.cache/mozilla
 # then add the volume mounts and restart the container
 
+Debug trace: open `agent-debug/<run-id>/trace.html` to see the last 100 numbered planner actions with screenshots/click overlays.
+Model compare: run `python3 scripts/compare_models.py --dump planner-dumps/<dump>.json --models "modelA,modelB"` to generate a side-by-side `compare.html`.
+
 

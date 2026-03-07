@@ -35,6 +35,9 @@ SCREEN_INDEX = int(os.environ.get("AGENT_SCREEN_INDEX", "1"))  # mss monitor ind
 DEBUG_ENABLED = os.environ.get("AGENT_DEBUG", "1") == "1"
 DEBUG_DIR = os.environ.get("AGENT_DEBUG_DIR", "/tmp/agent-debug")
 CLICK_CROP_DEBUG = os.environ.get("AGENT_DUMP_CLICK_CROPS", "1") == "1"
+TRACE_ENABLED = os.environ.get("AGENT_TRACE_ENABLED", "1") == "1"
+TRACE_MAX = int(os.environ.get("AGENT_TRACE_MAX", "100"))
+TRACE_FRAME_QUALITY = int(os.environ.get("AGENT_TRACE_FRAME_QUALITY", "70"))  # 25..95
 
 # Optional LLM (OpenAI-compatible or local)
 # Configure one of the following:
@@ -910,6 +913,15 @@ class ActionExecutorDynamic:
         if self.debug_enabled:
             ensure_dir(self.run_dir)
 
+        # Trace (numbered actions + HTML grid)
+        self.trace_enabled = bool(self.debug_enabled and TRACE_ENABLED)
+        self.trace_max = max(10, min(500, int(TRACE_MAX)))
+        self.trace_idx = 0
+        self.trace_path = os.path.join(self.run_dir, "trace.jsonl")
+        self.trace_html_path = os.path.join(self.run_dir, "trace.html")
+        self._trace_tail: List[Dict[str, Any]] = []
+        self._last_click_debug: Optional[Dict[str, Any]] = None
+
     # --- Logging, capture, OCR ---
     def _log(self, level: str, msg: str, extra: Optional[Dict[str, Any]] = None):
         rec = {"ts": now_utc_iso(), "level": level, "msg": msg}
@@ -972,11 +984,87 @@ class ActionExecutorDynamic:
                 "click_rel": [cx, cy],
                 "crop_bounds": [left, top, right, bottom],
             }
+            self._last_click_debug = meta
             self._log("info", "click.debug.crop_saved", meta)
             return meta
         except Exception as e:
             self._log("warn", "click.debug.crop_failed", {"error": str(e), "action": action})
             return None
+
+    def _trace_append(self, rec: Dict[str, Any]) -> None:
+        if not self.trace_enabled:
+            return
+        try:
+            # persist
+            line = safe_json_dumps(rec)
+            with open(self.trace_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+            # tail
+            self._trace_tail.append(rec)
+            if len(self._trace_tail) > self.trace_max:
+                self._trace_tail = self._trace_tail[-self.trace_max :]
+        except Exception as e:
+            self._log("warn", "trace.append_failed", {"error": str(e)})
+
+    def _trace_render_html(self) -> None:
+        if not self.trace_enabled:
+            return
+        try:
+            items = list(self._trace_tail)[-self.trace_max :]
+            cards = []
+            for it in reversed(items):
+                idx = it.get("idx")
+                ts = it.get("ts")
+                action = (it.get("decision") or {}).get("action", "")
+                params = json.dumps((it.get("decision") or {}).get("parameters", {}), ensure_ascii=False)[:400]
+                why = (it.get("decision") or {}).get("reasoning", "")[:260]
+                status = (it.get("result") or {}).get("status", "")
+                frame = it.get("frame_path") or ""
+                crop = it.get("crop_overlay_path") or ""
+                imgs = []
+                if crop:
+                    imgs.append(f'<img src="{os.path.basename(crop)}" alt="crop overlay"/>')
+                if frame:
+                    imgs.append(f'<img src="{os.path.basename(frame)}" alt="frame"/>')
+                img_html = "".join(imgs) if imgs else '<div class="noimg">no image</div>'
+                cards.append(
+                    f"""
+<div class="card">
+  <div class="hdr">
+    <div class="idx">#{idx}</div>
+    <div class="meta">{ts} · <b>{action}</b> · {status}</div>
+  </div>
+  <div class="imgs">{img_html}</div>
+  <div class="txt"><b>params</b> {params}</div>
+  <div class="txt"><b>why</b> {why}</div>
+</div>
+"""
+                )
+            html = f"""<!doctype html>
+<html><head><meta charset="utf-8"/>
+<title>Agent trace</title>
+<style>
+body {{ font-family: system-ui, Arial, sans-serif; margin: 16px; }}
+.grid {{ display:grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }}
+.card {{ border:1px solid #ddd; border-radius:10px; padding:10px; background:#fff; }}
+.hdr {{ display:flex; justify-content:space-between; align-items:baseline; gap:8px; }}
+.idx {{ font-weight:700; }}
+.meta {{ font-size:12px; color:#333; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
+.imgs {{ display:grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; }}
+img {{ width:100%; height:auto; border-radius:8px; background:#f6f6f6; }}
+.txt {{ font-size:12px; color:#222; margin-top:8px; word-break:break-word; }}
+.noimg {{ font-size:12px; color:#777; padding:18px; text-align:center; border:1px dashed #ccc; border-radius:8px; }}
+</style></head>
+<body>
+<h2>Last {len(items)} actions (auto-updated)</h2>
+<div class="grid">
+{''.join(cards)}
+</div>
+</body></html>"""
+            with open(self.trace_html_path, "w", encoding="utf-8") as f:
+                f.write(html)
+        except Exception as e:
+            self._log("warn", "trace.render_failed", {"error": str(e)})
 
     def _apply_candidate(self, cand: Candidate) -> Dict[str,Any]:
         if cand.action == "click_box":
@@ -1417,6 +1505,8 @@ class ActionExecutorDynamic:
 
         step = 0
         while step < MAX_STEPS:
+            # Monotonic trace id for HTML grid + dumps
+            self.trace_idx += 1
             # 1) Observe
             self._capture_state()
             ocr_min = [{"text": w["text"], "box": w["box"], "conf": w["conf"]} for w in self.last_ocr]
@@ -1507,6 +1597,16 @@ class ActionExecutorDynamic:
             completed = bool(resp.get("completed", False))
             self._log("info","planner.decision",{"action": op, "params": params, "why": reasoning})
 
+            # Trace: save the pre-action frame (what the planner saw)
+            frame_path = ""
+            if self.trace_enabled and self.last_img is not None:
+                try:
+                    q = max(25, min(95, int(TRACE_FRAME_QUALITY)))
+                    frame_path = os.path.join(self.run_dir, f"{self.trace_idx:05d}_{op}_frame.jpg")
+                    cv2.imwrite(frame_path, self.last_img, [int(cv2.IMWRITE_JPEG_QUALITY), q])
+                except Exception as e:
+                    self._log("warn", "trace.frame_save_failed", {"error": str(e)})
+
             # 3) Act
             result = {"status":"failure","error_code":"UNKNOWN_ACTION","error_message": op}
             try:
@@ -1553,6 +1653,23 @@ class ActionExecutorDynamic:
             # 4) Record
             self.history.append({"action": op, "parameters": params, "result": result})
             self._log("info","action.result",{"action": op, "result": result})
+
+            # 5) Trace record + regenerate HTML (last N)
+            crop_overlay = (self._last_click_debug or {}).get("overlay_path") if self._last_click_debug else ""
+            self._trace_append(
+                {
+                    "idx": self.trace_idx,
+                    "ts": now_utc_iso(),
+                    "decision": {"action": op, "parameters": params, "reasoning": reasoning, "completed": completed},
+                    "result": result,
+                    "frame_path": frame_path,
+                    "crop_overlay_path": crop_overlay,
+                    "ocr_results_n": len(ocr_min),
+                    "ui_elements_n": len(ui_elements),
+                    "screenshot_b64_len": len(screenshot_b64) if screenshot_b64 else 0,
+                }
+            )
+            self._trace_render_html()
             step += 1
             time.sleep(0.8)
  
