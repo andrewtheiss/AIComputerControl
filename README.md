@@ -143,7 +143,27 @@ docker cp vnc-instance-1:/root/.mozilla ./profiles/agent-1/.mozilla
 docker cp vnc-instance-1:/root/.cache/mozilla ./profiles/agent-1/.cache/mozilla
 # then add the volume mounts and restart the container
 
-Debug trace: open `agent-debug/<run-id>/trace.html` to see the last 100 numbered planner actions with screenshots/click overlays.
+Debug trace:
+```bash
+python3 scripts/open_latest_traces.py
+# or: python3 scripts/open_latest_traces.py --dry-run
+```
+This opens the latest active `agent-debug/*/trace.html` files in Windows Explorer.
+Use `--recent-seconds 600` only if you intentionally want to widen beyond the latest batch.
+The trace now also includes before/after frames, verification reason/evidence, state tags, and focus summaries so you can distinguish event dispatch from verified UI transitions.
 Model compare: run `python3 scripts/compare_models.py --dump planner-dumps/<dump>.json --models "modelA,modelB"` to generate a side-by-side `compare.html`.
+
+Fast restart commands while iterating on the agent/planner:
+```bash
+# Full clean restart of the whole stack
+docker compose down
+docker compose up -d --build
+
+# Rebuild and force-recreate just the planner + agents
+docker compose up -d --build --force-recreate task-planner vnc-instance-1 vnc-instance-2
+
+# Rebuild and force-recreate only one agent
+docker compose up -d --build --force-recreate vnc-instance-1
+```
 
 

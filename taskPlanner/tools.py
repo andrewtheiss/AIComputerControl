@@ -11,6 +11,11 @@ def open_url(url: str) -> str:
     Returns:
       Success/failure is reported by the executor; planner should assume success
       only after subsequent waits confirm target text is visible.
+
+    Notes:
+      - Opening a URL can leave browser chrome focused or trigger browser-level
+        blockers like suggestion overlays or session restore prompts.
+      - After open_url(), verify the new page state before typing or pressing Enter.
     """
     ...
 
@@ -56,6 +61,11 @@ def click_text(regex: str, nth: int = 0, prefer_bold: bool = False) -> str:
     Notes:
       - If you have multiple candidate strings, prefer click_any_text().
       - Use concise regex without leading/trailing whitespace.
+      - If blocker tags are present, use text clicks to clear the blocker first
+        rather than advancing the main goal.
+      - Multi-word labels can match a whole OCR line; use the visible phrase directly.
+      - If blocker details indicate allow_page_click_through=true, a visible page target
+        can be a valid dual-purpose click that dismisses browser chrome and progresses.
     """
     ...
 
@@ -71,6 +81,9 @@ def click_any_text(patterns: List[str], nth: int = 0, prefer_bold: bool = True) 
 
     Notes:
       - Ideal for "Sign in|Log in|Continue" flows.
+      - When blocker tags are present, the patterns should usually target dismiss,
+        allow, close, not now, cancel, or similar recovery controls first.
+      - If blocker details expose visible resolve_targets, use those exact visible labels.
     """
     ...
 
@@ -90,6 +103,7 @@ def click_near_text(anchor_regex: str, dx: int = 0, dy: int = 0) -> str:
       - Use only when the clickable icon has no text but is directly adjacent
         (e.g., a reply icon 24–48 px to the right of the word "Reply").
       - Keep |dx|,|dy| <= 120 unless absolutely necessary.
+      - Do not use this to guess through browser chrome overlays or other blockers.
     """
     ...
 
@@ -118,6 +132,8 @@ def type_text(text: str, confidential: bool = False) -> str:
     Notes:
       - Planner should first focus the target field (via click_text) or tab to it.
       - For passwords, set confidential=True.
+      - Do not type if focus is ambiguous or a blocker/browser overlay may still
+        own focus. Verify focus first.
     """
     ...
 
@@ -129,7 +145,13 @@ def key_seq(keys: List[str]) -> str:
       keys: Valid xdotool key names (Tab, Enter, BackSpace, Ctrl+l, etc.).
 
     Notes:
-      - Use to navigate forms, submit (Enter), or select fields.
+      - Use to navigate forms, dismiss blockers, submit (Enter), or select fields.
+      - Escape is the preferred first recovery for browser suggestion overlays.
+      - Do not press Enter unless focus or the visible state strongly supports
+        search/submit behavior.
+      - If repeated keyboard attempts produce no verified change, switch action class.
+      - Do not keep using Escape if recovery options show it already failed on the
+        same blocker state.
     """
     ...
 
@@ -143,6 +165,8 @@ def sleep(seconds: float = 0.8) -> str:
 
     Notes:
       - Use to debounce dynamic UIs between actions.
+      - Prefer short sleeps as part of verification or blocker recovery, not as a
+        substitute for confident progression.
     """
     ...
 

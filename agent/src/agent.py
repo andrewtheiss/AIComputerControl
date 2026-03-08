@@ -1,10 +1,12 @@
 # scripts/agent.py
-import os, re, time, json, threading, subprocess, io, uuid, shutil, traceback
+import os, re, time, json, threading, subprocess, io, uuid, shutil, traceback, hashlib
 from ui_core import UIElement, Observation
 from perception import fuse_observation
 from decision import ComposeProposer, SendProposer, DismissModalProposer, arbitrate, Candidate
 from typing import Any, Dict, List, Optional, Tuple, Union
 from datetime import datetime
+from screen_signatures import make_signature
+from blockers import classify_blockers
 
 import requests
 import yaml
@@ -38,6 +40,12 @@ CLICK_CROP_DEBUG = os.environ.get("AGENT_DUMP_CLICK_CROPS", "1") == "1"
 TRACE_ENABLED = os.environ.get("AGENT_TRACE_ENABLED", "1") == "1"
 TRACE_MAX = int(os.environ.get("AGENT_TRACE_MAX", "100"))
 TRACE_FRAME_QUALITY = int(os.environ.get("AGENT_TRACE_FRAME_QUALITY", "70"))  # 25..95
+POST_ACTION_VERIFY_TIMEOUT_S = float(os.environ.get("POST_ACTION_VERIFY_TIMEOUT_S", "2.2"))
+POST_ACTION_VERIFY_POLL_S = float(os.environ.get("POST_ACTION_VERIFY_POLL_S", "0.35"))
+POST_ACTION_VERIFY_STABLE_HITS = max(1, int(os.environ.get("POST_ACTION_VERIFY_STABLE_HITS", "2")))
+NOOP_SIMILARITY_THRESHOLD = float(os.environ.get("AGENT_NOOP_SIMILARITY_THRESHOLD", "0.985"))
+A11Y_BRIDGE_URL = os.environ.get("A11Y_BRIDGE_URL", "").strip()
+A11Y_FETCH_TIMEOUT_S = float(os.environ.get("A11Y_FETCH_TIMEOUT_S", "0.45"))
 
 # Optional LLM (OpenAI-compatible or local)
 # Configure one of the following:
@@ -113,11 +121,74 @@ def ocr_image(image_bgr: np.ndarray) -> List[Dict[str, Any]]:
     """Return OCR words with boxes using OCRClient (HTTP preferred, Tesseract fallback)."""
     return _ocr_client.ocr(image_bgr)
 
+def ocr_image_levels(image_bgr: np.ndarray) -> Dict[str, Any]:
+    """Return OCR word + line boxes using OCRClient (HTTP preferred, Tesseract fallback)."""
+    return _ocr_client.ocr_levels(image_bgr)
+
 def _score_boldish_height(box: List[int]) -> int:
     return box[3] - box[1]
 
+def _text_target_prefers_lines(*targets: Optional[Union[str, List[str]]]) -> bool:
+    for target in targets:
+        if isinstance(target, list):
+            if any(_text_target_prefers_lines(item) for item in target):
+                return True
+            continue
+        s = str(target or "")
+        if not s:
+            continue
+        if any(token in s for token in (" ", r"\s", r"\s+", r"\W")):
+            return True
+    return False
+
+def _find_text_box_in_items(
+    items: List[Dict[str, Any]],
+    *,
+    default_level: str,
+    regex: Optional[str] = None,
+    any_regex: Optional[List[str]] = None,
+    fuzzy_text: Optional[str] = None,
+    fuzzy_threshold: Optional[float] = None,
+    prefer_bold: bool = False,
+    nth: int = 0,
+) -> Optional[Dict[str, Any]]:
+    patterns = []
+    if regex:
+        patterns.append(re.compile(regex, re.I))
+    if any_regex:
+        patterns += [re.compile(r, re.I) for r in any_regex]
+
+    candidates: List[Tuple[float, Dict[str, Any]]] = []
+    for item in items or []:
+        s = str(item.get("text", "") or "")
+        match_score = None
+
+        if patterns:
+            if any(p.search(s) for p in patterns):
+                match_score = 100.0
+        elif fuzzy_text:
+            score = fuzz.partial_ratio(fuzzy_text, s)
+            if fuzzy_threshold is None or score >= float(fuzzy_threshold):
+                match_score = float(score)
+
+        if match_score is None:
+            continue
+
+        matched = dict(item)
+        matched.setdefault("level", default_level)
+        bonus = _score_boldish_height(matched["box"]) if prefer_bold else 0
+        candidates.append((match_score + bonus, matched))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda x: -x[0])
+    idx = min(nth, len(candidates) - 1)
+    return candidates[idx][1]
+
 def find_text_box(
     ocr_items: List[Dict[str, Any]],
+    line_items: Optional[List[Dict[str, Any]]] = None,
     regex: Optional[str] = None,
     any_regex: Optional[List[str]] = None,
     fuzzy_text: Optional[str] = None,
@@ -126,44 +197,35 @@ def find_text_box(
     nth: int = 0,
 ) -> Optional[Dict[str, Any]]:
     """
-    Find a word box by regex or fuzzy text.
+    Find a text box by regex or fuzzy text.
+    - For multi-word targets, line OCR is preferred and word OCR is used as fallback.
+    - For single-word targets, word OCR is preferred and line OCR is used as fallback.
     - regex / any_regex: case-insensitive compiled patterns
     - fuzzy_text + fuzzy_threshold (0..100): RapidFuzz partial_ratio scoring
     """
-    patterns = []
-    if regex:
-        patterns.append(re.compile(regex, re.I))
-    if any_regex:
-        patterns += [re.compile(r, re.I) for r in any_regex]
+    prefer_lines = _text_target_prefers_lines(regex, any_regex or [], fuzzy_text)
+    search_groups: List[Tuple[str, List[Dict[str, Any]]]] = []
+    if prefer_lines and line_items:
+        search_groups.append(("line", line_items))
+    if ocr_items:
+        search_groups.append(("word", ocr_items))
+    if not prefer_lines and line_items:
+        search_groups.append(("line", line_items))
 
-    candidates: List[Tuple[float, Dict[str, Any]]] = []
-
-    for w in ocr_items:
-        s = w["text"]
-        match_score = None
-
-        if patterns:
-            ok = any(p.search(s) for p in patterns)
-            if ok:
-                match_score = 100.0
-        elif fuzzy_text:
-            # partial_ratio works well for UI snippets
-            score = fuzz.partial_ratio(fuzzy_text, s)
-            if fuzzy_threshold is None or score >= float(fuzzy_threshold):
-                match_score = float(score)
-
-        if match_score is None:
-            continue
-
-        bonus = _score_boldish_height(w["box"]) if prefer_bold else 0
-        candidates.append((match_score + bonus, w))
-
-    if not candidates:
-        return None
-
-    candidates.sort(key=lambda x: -x[0])
-    idx = min(nth, len(candidates) - 1)
-    return candidates[idx][1]
+    for level, items in search_groups:
+        match = _find_text_box_in_items(
+            items,
+            default_level=level,
+            regex=regex,
+            any_regex=any_regex,
+            fuzzy_text=fuzzy_text,
+            fuzzy_threshold=fuzzy_threshold,
+            prefer_bold=prefer_bold,
+            nth=nth,
+        )
+        if match:
+            return match
+    return None
 
 # -----------------------
 # RT-DETR client with retries
@@ -453,6 +515,8 @@ class TaskRunner:
         self.grabber = ScreenGrabber(screen_index=SCREEN_INDEX)
         self.last_img: Optional[np.ndarray] = None
         self.last_ocr: Optional[List[Dict[str, Any]]] = None
+        self.last_ocr_words: Optional[List[Dict[str, Any]]] = None
+        self.last_ocr_lines: Optional[List[Dict[str, Any]]] = None
         self.last_dets: Optional[List[Dict[str, Any]]] = None
 
         # Debug / run folder
@@ -503,6 +567,8 @@ class TaskRunner:
             img, _mon = self.grabber.capture()
             self.last_img = img
             self.last_ocr = None
+            self.last_ocr_words = None
+            self.last_ocr_lines = None
             self.last_dets = None
             if self.debug_enabled:
                 raw_path = os.path.join(self.run_dir, f"{int(time.time()*1000)}_raw.jpg")
@@ -534,8 +600,11 @@ class TaskRunner:
     def _do_ocr(self) -> List[Dict[str, Any]]:
         if self.last_ocr is None:
             img = self._capture()
-            self.last_ocr = ocr_image(img)
-            self._log("debug", "ocr.done", {"n": len(self.last_ocr)})
+            ocr_levels = ocr_image_levels(img)
+            self.last_ocr_words = list(ocr_levels.get("words") or [])
+            self.last_ocr_lines = list(ocr_levels.get("lines") or [])
+            self.last_ocr = self.last_ocr_words
+            self._log("debug", "ocr.done", {"words": len(self.last_ocr_words), "lines": len(self.last_ocr_lines)})
         return self.last_ocr
 
     def _do_detect(self, save_overlay: bool = False) -> List[Dict[str, Any]]:
@@ -595,7 +664,7 @@ class TaskRunner:
             self._capture(force=True)
             ocr = self._do_ocr()
             w = find_text_box(
-                ocr, regex=regex, any_regex=any_regex,
+                ocr, line_items=self.last_ocr_lines, regex=regex, any_regex=any_regex,
                 fuzzy_text=fuzzy_text, fuzzy_threshold=fuzzy_threshold
             )
             if w:
@@ -610,6 +679,7 @@ class TaskRunner:
         ocr = self._do_ocr()
         w = find_text_box(
             ocr,
+            line_items=self.last_ocr_lines,
             regex=regex, any_regex=any_regex,
             fuzzy_text=fuzzy_text, fuzzy_threshold=fuzzy_threshold,
             prefer_bold=prefer_bold, nth=nth
@@ -904,6 +974,10 @@ class ActionExecutorDynamic:
         self.grabber = ScreenGrabber(screen_index=SCREEN_INDEX)
         self.last_img: Optional[np.ndarray] = None
         self.last_ocr: List[Dict[str, Any]] = []
+        self.last_ocr_words: List[Dict[str, Any]] = []
+        self.last_ocr_lines: List[Dict[str, Any]] = []
+        self.last_ocr_source: str = ""
+        self.last_ax_nodes: List[Dict[str, Any]] = []
         self._xdotool_ok = which("xdotool") is not None
 
         # Debug folder (persist crops/overlays if host mounts AGENT_DEBUG_DIR)
@@ -1015,28 +1089,65 @@ class ActionExecutorDynamic:
             for it in reversed(items):
                 idx = it.get("idx")
                 ts = it.get("ts")
-                action = (it.get("decision") or {}).get("action", "")
-                params = json.dumps((it.get("decision") or {}).get("parameters", {}), ensure_ascii=False)[:400]
+                planner_action = (it.get("decision") or {}).get("action", "")
+                planner_params = json.dumps((it.get("decision") or {}).get("parameters", {}), ensure_ascii=False)[:400]
                 why = (it.get("decision") or {}).get("reasoning", "")[:260]
-                status = (it.get("result") or {}).get("status", "")
+                result = it.get("result") or {}
+                executed_action = result.get("executed_action") or planner_action
+                executed_params = json.dumps(result.get("executed_parameters") or (it.get("decision") or {}).get("parameters", {}), ensure_ascii=False)[:400]
+                status = result.get("status", "")
+                verification = result.get("verification") or {}
+                before_state = result.get("before_state") or {}
+                after_state = result.get("after_state") or {}
+                focus_before = before_state.get("focused_role") or before_state.get("focused_name") or ""
+                focus_after = after_state.get("focused_role") or after_state.get("focused_name") or ""
+                verification_reason = verification.get("reason", "")
+                verification_evidence = ", ".join((verification.get("evidence") or [])[:4])
+                event_applied = result.get("event_applied")
+                outcome_verified = result.get("outcome_verified")
+                targeting_source = result.get("targeting_source") or result.get("ocr_level") or result.get("anchor_level") or ""
+                executor_override_reason = result.get("executor_override_reason") or ""
+                blocker_class = result.get("blocker_class") or ""
+                recovery_strategy = result.get("recovery_strategy") or ""
+                recovery_effect = result.get("recovery_effect") or ""
                 frame = it.get("frame_path") or ""
+                post_frame = it.get("post_frame_path") or ""
                 crop = it.get("crop_overlay_path") or ""
                 imgs = []
                 if crop:
-                    imgs.append(f'<img src="{os.path.basename(crop)}" alt="crop overlay"/>')
+                    imgs.append(f'<figure><img src="{os.path.basename(crop)}" alt="crop overlay"/><figcaption>target</figcaption></figure>')
                 if frame:
-                    imgs.append(f'<img src="{os.path.basename(frame)}" alt="frame"/>')
+                    imgs.append(f'<figure><img src="{os.path.basename(frame)}" alt="frame"/><figcaption>before</figcaption></figure>')
+                if post_frame:
+                    imgs.append(f'<figure><img src="{os.path.basename(post_frame)}" alt="post frame"/><figcaption>after</figcaption></figure>')
                 img_html = "".join(imgs) if imgs else '<div class="noimg">no image</div>'
+                card_cls = "card"
+                if status == "success" and outcome_verified:
+                    card_cls += " ok"
+                elif status == "dispatched" or (event_applied and not outcome_verified):
+                    card_cls += " warn"
+                else:
+                    card_cls += " bad"
                 cards.append(
                     f"""
-<div class="card">
+<div class="{card_cls}">
   <div class="hdr">
     <div class="idx">#{idx}</div>
-    <div class="meta">{ts} · <b>{action}</b> · {status}</div>
+    <div class="meta">{ts} · <b>{executed_action}</b> · {status}</div>
   </div>
   <div class="imgs">{img_html}</div>
-  <div class="txt"><b>params</b> {params}</div>
+  <div class="txt"><b>planner</b> {planner_action} {planner_params}</div>
+  <div class="txt"><b>executed</b> {executed_action} {executed_params}</div>
   <div class="txt"><b>why</b> {why}</div>
+  <div class="txt"><b>verification</b> applied={event_applied} verified={outcome_verified} reason={verification_reason}</div>
+  <div class="txt"><b>blocker</b> {blocker_class}</div>
+  <div class="txt"><b>recovery</b> strategy={recovery_strategy} effect={recovery_effect}</div>
+  <div class="txt"><b>targeting</b> {targeting_source}</div>
+  <div class="txt"><b>override</b> {executor_override_reason}</div>
+  <div class="txt"><b>evidence</b> {verification_evidence}</div>
+  <div class="txt"><b>before tags</b> {before_state.get("tags", [])}</div>
+  <div class="txt"><b>after tags</b> {after_state.get("tags", [])}</div>
+  <div class="txt"><b>focus</b> {focus_before} -> {focus_after}</div>
 </div>
 """
                 )
@@ -1047,10 +1158,15 @@ class ActionExecutorDynamic:
 body {{ font-family: system-ui, Arial, sans-serif; margin: 16px; }}
 .grid {{ display:grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }}
 .card {{ border:1px solid #ddd; border-radius:10px; padding:10px; background:#fff; }}
+.card.ok {{ border-color:#9ad0a0; background:#f5fff6; }}
+.card.warn {{ border-color:#e9c46a; background:#fffaf0; }}
+.card.bad {{ border-color:#ef9a9a; background:#fff5f5; }}
 .hdr {{ display:flex; justify-content:space-between; align-items:baseline; gap:8px; }}
 .idx {{ font-weight:700; }}
 .meta {{ font-size:12px; color:#333; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
-.imgs {{ display:grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; }}
+.imgs {{ display:grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 8px; }}
+figure {{ margin:0; }}
+figcaption {{ font-size:11px; color:#666; margin-top:4px; text-align:center; }}
 img {{ width:100%; height:auto; border-radius:8px; background:#f6f6f6; }}
 .txt {{ font-size:12px; color:#222; margin-top:8px; word-break:break-word; }}
 .noimg {{ font-size:12px; color:#777; padding:18px; text-align:center; border:1px dashed #ccc; border-radius:8px; }}
@@ -1065,6 +1181,924 @@ img {{ width:100%; height:auto; border-radius:8px; background:#f6f6f6; }}
                 f.write(html)
         except Exception as e:
             self._log("warn", "trace.render_failed", {"error": str(e)})
+
+    def _save_trace_frame(self, op: str, suffix: str) -> str:
+        if not (self.trace_enabled and self.last_img is not None):
+            return ""
+        try:
+            q = max(25, min(95, int(TRACE_FRAME_QUALITY)))
+            path = os.path.join(self.run_dir, f"{self.trace_idx:05d}_{op}_{suffix}.jpg")
+            cv2.imwrite(path, self.last_img, [int(cv2.IMWRITE_JPEG_QUALITY), q])
+            return path
+        except Exception as e:
+            self._log("warn", "trace.frame_save_failed", {"error": str(e), "suffix": suffix, "action": op})
+            return ""
+
+    def _normalize_visible_text(self, s: str) -> str:
+        return re.sub(r"\s+", " ", (s or "").strip().lower())
+
+    def _current_text_items(self) -> List[Dict[str, Any]]:
+        return self.last_ocr_lines or self.last_ocr_words or self.last_ocr or []
+
+    def _active_blockers(self, snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
+        blockers = snapshot.get("blockers")
+        return blockers if isinstance(blockers, list) else []
+
+    def _primary_blocker(self, snapshot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        blockers = self._active_blockers(snapshot)
+        return blockers[0] if blockers else None
+
+    def _blocker_tags(self, snapshot: Dict[str, Any]) -> List[str]:
+        tags = [str(tag) for tag in (snapshot.get("tags") or []) if str(tag).startswith("blocker:")]
+        for blocker in self._active_blockers(snapshot):
+            cls = str(blocker.get("class", "") or "").strip()
+            if cls:
+                tag = f"blocker:{cls}"
+                if tag not in tags:
+                    tags.append(tag)
+        return tags
+
+    def _blocker_signature(self, snapshot: Dict[str, Any]) -> str:
+        return str(snapshot.get("blocker_signature", "") or "")
+
+    def _box_iou(self, a: Optional[List[int]], b: Optional[List[int]]) -> float:
+        if not a or not b or len(a) != 4 or len(b) != 4:
+            return 0.0
+        ax1, ay1, ax2, ay2 = [int(v) for v in a]
+        bx1, by1, bx2, by2 = [int(v) for v in b]
+        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+        inter = iw * ih
+        if inter <= 0:
+            return 0.0
+        area_a = max(1, (ax2 - ax1) * (ay2 - ay1))
+        area_b = max(1, (bx2 - bx1) * (by2 - by1))
+        return float(inter / max(1, area_a + area_b - inter))
+
+    def _chrome_bottom_estimate(self, snapshot: Dict[str, Any], blocker: Optional[Dict[str, Any]] = None) -> int:
+        h = int(self.last_img.shape[0]) if self.last_img is not None else 900
+        estimate = min(max(96, int(h * 0.16)), 180)
+        if blocker and blocker.get("scope") == "browser_chrome":
+            bbox = blocker.get("bbox")
+            if isinstance(bbox, list) and len(bbox) == 4:
+                estimate = max(estimate, int(bbox[3]) + 16)
+        return estimate
+
+    def _target_scope_from_box(
+        self,
+        box: Optional[List[int]],
+        snapshot: Dict[str, Any],
+        blocker: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        if not box or len(box) != 4:
+            return "unknown"
+        primary = blocker or self._primary_blocker(snapshot)
+        if primary and self._box_iou(box, primary.get("bbox")) >= 0.25:
+            return str(primary.get("scope") or "blocker_surface")
+        chrome_bottom = self._chrome_bottom_estimate(snapshot, primary)
+        if int(box[3]) <= chrome_bottom:
+            return "browser_chrome"
+        return "page_content"
+
+    def _resolve_action_target(
+        self,
+        action: str,
+        params: Dict[str, Any],
+        snapshot: Dict[str, Any],
+        blocker: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        target: Optional[Dict[str, Any]] = None
+        if action == "click_text":
+            target = find_text_box(
+                self.last_ocr_words or self.last_ocr,
+                line_items=self.last_ocr_lines,
+                regex=params.get("regex"),
+                nth=int(params.get("nth", 0)),
+                prefer_bold=bool(params.get("prefer_bold", False)),
+                fuzzy_text=params.get("fuzzy_text"),
+                fuzzy_threshold=params.get("fuzzy_threshold"),
+            )
+        elif action == "click_any_text":
+            patterns = params.get("patterns") or []
+            for pat in patterns:
+                target = find_text_box(
+                    self.last_ocr_words or self.last_ocr,
+                    line_items=self.last_ocr_lines,
+                    regex=pat,
+                    nth=int(params.get("nth", 0)),
+                    prefer_bold=bool(params.get("prefer_bold", True)),
+                )
+                if target:
+                    break
+        elif action == "click_near_text":
+            target = find_text_box(
+                self.last_ocr_words or self.last_ocr,
+                line_items=self.last_ocr_lines,
+                regex=params.get("anchor_regex"),
+            )
+        elif action == "click_box" and isinstance(params.get("box"), list):
+            target = {"box": [int(v) for v in params.get("box", [0, 0, 0, 0])], "text": "", "level": "box"}
+
+        if not target:
+            return None
+
+        target_box = target.get("box") if isinstance(target.get("box"), list) else None
+        info = {
+            "text": str(target.get("text", "") or ""),
+            "box": [int(v) for v in target_box] if target_box else None,
+            "level": str(target.get("level", "") or ""),
+            "scope": self._target_scope_from_box(target_box, snapshot, blocker),
+        }
+        return info
+
+    def _page_click_away_box(self, snapshot: Dict[str, Any], blocker: Optional[Dict[str, Any]]) -> Optional[List[int]]:
+        if self.last_img is None:
+            return None
+        h, w = self.last_img.shape[:2]
+        cx = w // 2
+        cy = max(int(h * 0.55), self._chrome_bottom_estimate(snapshot, blocker) + 60)
+        if blocker and isinstance(blocker.get("bbox"), list) and len(blocker.get("bbox")) == 4:
+            bx1, by1, bx2, by2 = [int(v) for v in blocker.get("bbox", [0, 0, 0, 0])]
+            if by2 + 80 < h:
+                cy = max(cy, by2 + 80)
+            if bx1 <= cx <= bx2:
+                cx = min(w - 40, max(40, bx2 + 80))
+        return [max(0, cx - 12), max(0, cy - 12), min(w, cx + 12), min(h, cy + 12)]
+
+    def _match_resolve_target(self, blocker: Dict[str, Any], target: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not target:
+            return None
+        target_text = self._normalize_visible_text(str(target.get("text", "") or ""))
+        target_box = target.get("box")
+        for candidate in blocker.get("resolve_targets") or []:
+            cand_text = self._normalize_visible_text(str(candidate.get("text", "") or candidate.get("label", "") or ""))
+            cand_box = candidate.get("box")
+            if target_text and cand_text and target_text == cand_text:
+                return candidate
+            if self._box_iou(target_box, cand_box) >= 0.45:
+                return candidate
+        return None
+
+    def _action_strategy(self, action: str, params: Dict[str, Any], target: Optional[Dict[str, Any]], blocker: Optional[Dict[str, Any]]) -> str:
+        if action in ("click_text", "click_any_text", "click_near_text", "click_box"):
+            match = self._match_resolve_target(blocker or {}, target)
+            if match is not None:
+                return "click_visible_resolve_target"
+            scope = str((target or {}).get("scope") or "")
+            if scope == "page_content":
+                return "click_visible_page_target"
+            if scope == "browser_chrome":
+                return "click_browser_chrome"
+            if scope:
+                return "click_blocker_surface"
+            return "click"
+        if action == "type_text":
+            return "type"
+        if action == "wait_text":
+            return "wait_text"
+        if action == "wait_any_text":
+            return "wait_any_text"
+        if action == "open_url":
+            return "open_url"
+        if action == "sleep":
+            return "sleep"
+        if action == "ocr_extract":
+            return "ocr_extract"
+        if action == "key_seq":
+            keys = self._normalize_key_sequence((params or {}).get("keys", []))
+            keys_blob = ",".join(str(k).lower() for k in keys)
+            if "escape" in keys_blob:
+                return "escape"
+            if "ctrl+l" in keys_blob:
+                return "refocus_urlbar"
+            if "tab" in keys_blob:
+                return "tab"
+            if "return" in keys_blob or "enter" in keys_blob:
+                return "submit_key"
+            return "key_seq"
+        return action
+
+    def _action_family(self, action: str, params: Optional[Dict[str, Any]] = None) -> str:
+        if action in ("click_text", "click_any_text", "click_near_text", "click_box"):
+            return "click"
+        if action == "type_text":
+            return "type"
+        if action == "wait_text":
+            return "wait_text"
+        if action == "wait_any_text":
+            return "wait_any_text"
+        if action == "open_url":
+            return "open_url"
+        if action == "sleep":
+            return "sleep"
+        if action == "ocr_extract":
+            return "ocr_extract"
+        if action == "run_llm":
+            return "run_llm"
+        if action == "key_seq":
+            keys = self._normalize_key_sequence((params or {}).get("keys", []))
+            keys_blob = ",".join(str(k).lower() for k in keys)
+            if "escape" in keys_blob:
+                return "escape"
+            if "ctrl+l" in keys_blob:
+                return "refocus_urlbar"
+            if "tab" in keys_blob:
+                return "tab"
+            if "return" in keys_blob or "enter" in keys_blob:
+                return "submit_key"
+            return "key_seq"
+        return action
+
+    def _is_blocker_sensitive_action(self, action: str, params: Optional[Dict[str, Any]] = None) -> bool:
+        family = self._action_family(action, params)
+        return family in {"click", "type", "submit_key", "open_url"}
+
+    def _recent_blocker_attempts(self, blocker_signature: str) -> List[Dict[str, Any]]:
+        if not blocker_signature:
+            return []
+        attempts: List[Dict[str, Any]] = []
+        for item in self.history[-16:]:
+            result = item.get("result") or {}
+            before_state = result.get("before_state") or {}
+            after_state = result.get("after_state") or {}
+            if blocker_signature not in {
+                str(before_state.get("blocker_signature", "") or ""),
+                str(after_state.get("blocker_signature", "") or ""),
+            }:
+                continue
+            attempts.append(
+                {
+                    "action": item.get("action"),
+                    "parameters": item.get("parameters") or {},
+                    "status": result.get("status"),
+                    "strategy": result.get("recovery_strategy") or self._action_family(item.get("action", ""), item.get("parameters") or {}),
+                    "effect": result.get("recovery_effect") or result.get("verification", {}).get("reason", ""),
+                    "verified": result.get("outcome_verified"),
+                }
+            )
+        return attempts
+
+    def _attempt_counts(self, attempts: List[Dict[str, Any]]) -> Dict[str, int]:
+        counts: Dict[str, int] = {}
+        for attempt in attempts:
+            strategy = str(attempt.get("strategy", "") or "")
+            if not strategy:
+                continue
+            counts[strategy] = counts.get(strategy, 0) + 1
+        return counts
+
+    def _recovery_options(self, snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
+        blocker = self._primary_blocker(snapshot)
+        if not blocker:
+            return []
+        counts = self._attempt_counts(self._recent_blocker_attempts(str(blocker.get("signature", "") or "")))
+        options: List[Dict[str, Any]] = []
+        for target in blocker.get("resolve_targets") or []:
+            options.append(
+                {
+                    "strategy": "click_visible_resolve_target",
+                    "label": str(target.get("label", "") or target.get("text", "") or ""),
+                    "box": target.get("box"),
+                    "dual_purpose": bool(target.get("dual_purpose", False)),
+                    "attempts": counts.get("click_visible_resolve_target", 0),
+                }
+            )
+        if blocker.get("class") == "browser_url_suggestion_dropdown":
+            options.extend(
+                [
+                    {"strategy": "escape", "label": "Press Escape", "attempts": counts.get("escape", 0)},
+                    {"strategy": "click_away_page", "label": "Click page content or blank area", "attempts": counts.get("click_away_page", 0)},
+                    {"strategy": "refocus_urlbar", "label": "Refocus URL bar", "attempts": counts.get("refocus_urlbar", 0)},
+                    {"strategy": "open_url", "label": "Open target URL in new window", "attempts": counts.get("open_url", 0)},
+                ]
+            )
+        else:
+            options.extend(
+                [
+                    {"strategy": s, "label": s.replace("_", " "), "attempts": counts.get(s, 0)}
+                    for s in blocker.get("suggested_strategies") or []
+                    if s != "click_visible_resolve_target"
+                ]
+            )
+        return options[:8]
+
+    def _recovery_effect(self, before_snapshot: Dict[str, Any], after_snapshot: Dict[str, Any]) -> str:
+        before_sig = self._blocker_signature(before_snapshot)
+        after_sig = self._blocker_signature(after_snapshot)
+        if before_sig and not after_sig:
+            return "blocker_cleared"
+        if before_sig and after_sig and before_sig != after_sig:
+            return "blocker_changed"
+        if before_sig and after_sig and before_sig == after_sig:
+            return "blocker_unchanged"
+        return "no_blocker"
+
+    def _default_blocker_recovery_hint(self, before_snapshot: Dict[str, Any], after_snapshot: Optional[Dict[str, Any]] = None) -> str:
+        blocker = self._primary_blocker(after_snapshot or before_snapshot) or self._primary_blocker(before_snapshot)
+        blocker_class = str((blocker or {}).get("class", "") or "")
+        if blocker_class == "browser_url_suggestion_dropdown":
+            return "use_page_click_or_open_url_not_repeated_escape"
+        if blocker_class == "browser_session_restore":
+            return "click_visible_session_restore_target_or_open_url"
+        if blocker_class:
+            return "clear_blocker_before_progressing"
+        return "verify_state_before_continuing"
+
+    def _blocker_policy_directive(
+        self,
+        action: str,
+        params: Dict[str, Any],
+        snapshot: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        blocker = self._primary_blocker(snapshot)
+        if blocker is None:
+            return {"decision": "allow", "action": action, "params": params, "strategy": self._action_family(action, params)}
+
+        target = self._resolve_action_target(action, params, snapshot, blocker)
+        strategy = self._action_strategy(action, params, target, blocker)
+        attempts = self._recent_blocker_attempts(str(blocker.get("signature", "") or ""))
+        counts = self._attempt_counts(attempts)
+        blocker_class = str(blocker.get("class", "") or "")
+        focus = snapshot.get("ax") or {}
+
+        def allow(reason: str) -> Dict[str, Any]:
+            return {
+                "decision": "allow",
+                "action": action,
+                "params": params,
+                "reason": reason,
+                "strategy": strategy,
+                "target": target,
+                "blocker": blocker,
+            }
+
+        def override(new_action: str, new_params: Dict[str, Any], reason: str, override_strategy: str) -> Dict[str, Any]:
+            return {
+                "decision": "override",
+                "action": new_action,
+                "params": new_params,
+                "reason": reason,
+                "strategy": override_strategy,
+                "target": target,
+                "blocker": blocker,
+            }
+
+        def block(reason: str) -> Dict[str, Any]:
+            return {
+                "decision": "block",
+                "action": action,
+                "params": params,
+                "reason": reason,
+                "strategy": strategy,
+                "target": target,
+                "blocker": blocker,
+            }
+
+        if blocker_class == "browser_url_suggestion_dropdown":
+            if strategy == "click_visible_page_target":
+                return allow("page_target_click_can_clear_chrome_dropdown")
+            if strategy == "open_url":
+                return allow("open_url_bypasses_browser_dropdown")
+            if strategy == "escape" and counts.get("escape", 0) < 1:
+                return allow("first_escape_attempt_allowed_for_browser_dropdown")
+            if strategy == "click_browser_chrome" and counts.get("click_browser_chrome", 0) < 1:
+                return allow("single_browser_chrome_refocus_attempt_allowed")
+            if strategy == "refocus_urlbar" and counts.get("refocus_urlbar", 0) < 1:
+                return allow("single_urlbar_refocus_attempt_allowed")
+            if strategy == "type" and focus.get("focused_editable"):
+                return allow("typing_allowed_once_focus_is_editable")
+            if strategy == "submit_key" and focus.get("focused_editable") and counts.get("submit_key", 0) < 1:
+                return allow("submit_allowed_when_editable_focus_confirms_intent")
+            if counts.get("escape", 0) < 1:
+                return override("key_seq", {"keys": ["Escape"]}, "browser_dropdown_first_try_escape", "escape")
+            click_away_box = self._page_click_away_box(snapshot, blocker)
+            if click_away_box and counts.get("click_away_page", 0) < 1:
+                return override("click_box", {"box": click_away_box}, "browser_dropdown_try_click_away", "click_away_page")
+            if counts.get("refocus_urlbar", 0) < 1:
+                return override("key_seq", {"keys": ["Ctrl+l"]}, "browser_dropdown_refocus_urlbar", "refocus_urlbar")
+            return block("browser_dropdown_requires_page_target_or_open_url_not_more_escape")
+
+        if strategy == "click_visible_resolve_target":
+            return allow("visible_blocker_resolve_target_selected")
+        if strategy == "open_url" and blocker_class in ("browser_session_restore", "browser_interstitial_error"):
+            return allow("open_url_can_bypass_browser_page_interstitial")
+        if blocker_class in ("browser_permission_prompt", "modal_dialog", "cookie_banner"):
+            if strategy == "escape" and counts.get("escape", 0) < 1:
+                return allow("single_escape_attempt_allowed_for_dialog_like_blocker")
+            if strategy == "click_away_page" and blocker_class == "cookie_banner" and counts.get("click_away_page", 0) < 1:
+                return allow("single_click_away_allowed_for_cookie_banner")
+
+        resolve_targets = blocker.get("resolve_targets") or []
+        if resolve_targets and counts.get("click_visible_resolve_target", 0) < 2:
+            primary = resolve_targets[0]
+            return override(
+                "click_box",
+                {"box": [int(v) for v in primary.get("box", [0, 0, 0, 0])]},
+                f"use_visible_{blocker_class}_resolve_target",
+                "click_visible_resolve_target",
+            )
+        if blocker_class in ("browser_permission_prompt", "modal_dialog", "cookie_banner") and counts.get("escape", 0) < 1:
+            return override("key_seq", {"keys": ["Escape"]}, f"fallback_escape_for_{blocker_class}", "escape")
+        return block(f"{blocker_class}_blocks_requested_action_until_resolved")
+
+    def _executor_guard_result(
+        self,
+        action: str,
+        params: Dict[str, Any],
+        snapshot: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        ax = snapshot.get("ax") or {}
+        if action == "type_text" and ax.get("available") and not ax.get("focused_editable"):
+            return {
+                "status": "failure",
+                "error_code": "FOCUS_NOT_EDITABLE",
+                "error_message": f"Focused AX node is not editable ({ax.get('focused_role') or 'unknown'})",
+                "event_applied": False,
+                "recovery_hint": "refocus_editable_field",
+            }
+
+        blocker_policy = self._blocker_policy_directive(action, params, snapshot)
+        if blocker_policy.get("decision") == "block":
+            blocker = blocker_policy.get("blocker") or {}
+            return {
+                "status": "failure",
+                "error_code": "BLOCKER_POLICY_BLOCKED",
+                "error_message": str(blocker_policy.get("reason", "Blocked by blocker policy")),
+                "event_applied": False,
+                "recovery_hint": self._default_blocker_recovery_hint(snapshot),
+                "blocker_class": blocker.get("class"),
+                "blocker_signature": blocker.get("signature"),
+                "recovery_strategy": blocker_policy.get("strategy"),
+                "recovery_options": self._recovery_options(snapshot),
+            }
+
+        if not self.history:
+            return None
+
+        last = self.history[-1]
+        last_result = last.get("result") or {}
+        last_unresolved = last_result.get("status") == "dispatched" or last_result.get("outcome_verified") is False
+        if not last_unresolved:
+            return None
+
+        current_hash = snapshot.get("hash", "")
+        last_after_hash = ((last_result.get("after_state") or {}).get("hash") or "")
+        last_before_hash = ((last_result.get("before_state") or {}).get("hash") or "")
+        same_state = bool(current_hash) and current_hash in {last_after_hash, last_before_hash}
+        same_family = self._action_family(last.get("action", ""), last.get("parameters") or {}) == self._action_family(action, params)
+        last_streak = int(last_result.get("same_action_same_state_streak") or 1)
+        if same_state and same_family and last_streak > 1:
+            return {
+                "status": "failure",
+                "error_code": "ANTI_REPEAT_GUARD",
+                "error_message": "Repeated same-family action on the same unresolved state was blocked",
+                "event_applied": False,
+                "recovery_hint": "change_action_family",
+                "guard_reason": "same_family_repeated_after_unverified_state",
+            }
+        return None
+
+    def _fetch_ax_nodes(self) -> List[Dict[str, Any]]:
+        if not A11Y_BRIDGE_URL:
+            return []
+        try:
+            r = requests.get(f"{A11Y_BRIDGE_URL}/ax/snapshot", timeout=A11Y_FETCH_TIMEOUT_S)
+            r.raise_for_status()
+            nodes = r.json()
+            return nodes if isinstance(nodes, list) else []
+        except Exception:
+            return []
+
+    def _ax_state_tokens(self, node: Dict[str, Any]) -> set:
+        tokens = set()
+        for key in ("state", "states", "flags"):
+            raw = node.get(key)
+            if isinstance(raw, str):
+                tokens |= {tok.strip().lower() for tok in re.split(r"[,| ]+", raw) if tok.strip()}
+            elif isinstance(raw, list):
+                tokens |= {str(tok).strip().lower() for tok in raw if str(tok).strip()}
+            elif isinstance(raw, dict):
+                for name, enabled in raw.items():
+                    if enabled:
+                        tokens.add(str(name).strip().lower())
+        return tokens
+
+    def _ax_flag(self, node: Dict[str, Any], *names: str) -> bool:
+        names_norm = {str(name).strip().lower() for name in names}
+        for key, value in node.items():
+            key_norm = str(key).strip().lower()
+            if key_norm in names_norm:
+                if isinstance(value, bool):
+                    return value
+                if isinstance(value, str) and value.strip().lower() in ("true", "1", "yes", "focused", "editable", "selected"):
+                    return True
+        tokens = self._ax_state_tokens(node)
+        return any(name in tokens for name in names_norm)
+
+    def _ax_text(self, node: Dict[str, Any]) -> str:
+        return str(node.get("name") or node.get("label") or node.get("description") or "").strip()
+
+    def _ax_value_text(self, node: Dict[str, Any]) -> str:
+        return str(node.get("value") or node.get("text") or "").strip()
+
+    def _ax_focus_summary(self, nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
+        summary: Dict[str, Any] = {
+            "available": bool(nodes),
+            "focus_hash": "",
+            "focused_role": "",
+            "focused_name": "",
+            "focused_value": "",
+            "focused_value_norm": "",
+            "focused_editable": False,
+            "focused_box": None,
+        }
+        if not nodes:
+            return summary
+
+        focused = None
+        for node in nodes:
+            if self._ax_flag(node, "focused", "active"):
+                focused = node
+                break
+        if focused is None:
+            return summary
+
+        role = str(focused.get("role") or "").strip().lower()
+        name = self._ax_text(focused)
+        value = self._ax_value_text(focused)
+        editable = self._ax_flag(focused, "editable") or role in ("textbox", "searchbox", "textarea", "entry", "combobox", "input")
+        box = focused.get("box")
+        focus_key = json.dumps({
+            "role": role,
+            "name": name,
+            "value": value,
+            "box": box,
+            "editable": editable,
+        }, ensure_ascii=False, sort_keys=True)
+        summary.update({
+            "focus_hash": hashlib.sha1(focus_key.encode("utf-8")).hexdigest()[:12],
+            "focused_role": role,
+            "focused_name": name,
+            "focused_value": value,
+            "focused_value_norm": self._normalize_visible_text(value),
+            "focused_editable": bool(editable),
+            "focused_box": box,
+        })
+        return summary
+
+    def _state_snapshot(self) -> Dict[str, Any]:
+        texts: List[str] = []
+        top_texts: List[str] = []
+        seen = set()
+        text_items = self._current_text_items()
+        for w in text_items:
+            t = str(w.get("text", "") or "").strip()
+            if not t:
+                continue
+            texts.append(t)
+            key = self._normalize_visible_text(t)
+            if key and key not in seen and len(top_texts) < 10:
+                seen.add(key)
+                top_texts.append(t)
+
+        text_blob = " ".join(texts)
+        text_blob_norm = self._normalize_visible_text(text_blob)
+        tags: List[str] = []
+        blockers = classify_blockers(text_items)
+        blocker_signature = str(blockers[0].get("signature", "") or "") if blockers else ""
+
+        def add_tag(tag: str) -> None:
+            if tag not in tags:
+                tags.append(tag)
+
+        if any(tok in text_blob_norm for tok in ("firefox", "new tab", "search with google", "switch to tab", "gmail", "ebay", "amazon", "session restore")):
+            add_tag("app:browser_like")
+        for blocker in blockers:
+            blocker_class = str(blocker.get("class", "") or "").strip()
+            if blocker_class:
+                add_tag(f"blocker:{blocker_class}")
+            for legacy_tag in blocker.get("legacy_tags") or []:
+                add_tag(str(legacy_tag))
+        if any(tok in text_blob_norm for tok in ("loading", "please wait", "just a moment", "opening", "working")):
+            add_tag("phase:loading_like")
+        if any(tok in text_blob_norm for tok in ("search", "results", "sort", "filter", "price", "buy now", "add to cart", "cart")):
+            add_tag("surface:results_like")
+        if any(tok in text_blob_norm for tok in ("compose", "new message", "send", "subject", "recipients", "inbox")):
+            add_tag("surface:mail_like")
+        if any(tok in text_blob_norm for tok in ("sign in", "log in", "password", "username", "email")):
+            add_tag("surface:auth_like")
+
+        ax_summary = self._ax_focus_summary(self.last_ax_nodes or [])
+        if ax_summary.get("available"):
+            add_tag("sensor:ax")
+        if ax_summary.get("focused_role"):
+            add_tag(f"focus:{ax_summary.get('focused_role')}")
+        if ax_summary.get("focused_editable"):
+            add_tag("focus:editable")
+        if not tags:
+            add_tag("state:unclassified")
+
+        sig_vec = None
+        state_hash = ""
+        if self.last_img is not None:
+            try:
+                sig_vec = make_signature(self.last_img, self.last_ocr_words or self.last_ocr or [])
+                state_hash = hashlib.sha1(sig_vec.tobytes()).hexdigest()[:12]
+            except Exception as e:
+                self._log("warn", "state.signature_failed", {"error": str(e)})
+
+        return {
+            "hash": state_hash,
+            "tags": tags,
+            "top_texts": top_texts,
+            "ocr_count": len(self.last_ocr or []),
+            "blockers": blockers,
+            "blocker_signature": blocker_signature,
+            "visible_resolve_targets": [target for blocker in blockers for target in (blocker.get("resolve_targets") or [])][:8],
+            "text_blob": text_blob,
+            "text_blob_norm": text_blob_norm,
+            "signature_vec": sig_vec,
+            "ax": ax_summary,
+        }
+
+    def _public_state_snapshot(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        ax = snapshot.get("ax") or {}
+        blockers = []
+        for blocker in self._active_blockers(snapshot)[:3]:
+            blockers.append(
+                {
+                    "class": blocker.get("class"),
+                    "scope": blocker.get("scope"),
+                    "confidence": blocker.get("confidence"),
+                    "bbox": blocker.get("bbox"),
+                    "evidence": list(blocker.get("evidence") or [])[:3],
+                    "allow_page_click_through": bool(blocker.get("allow_page_click_through", False)),
+                    "resolve_targets": list(blocker.get("resolve_targets") or [])[:4],
+                    "suggested_strategies": list(blocker.get("suggested_strategies") or [])[:5],
+                }
+            )
+        return {
+            "hash": snapshot.get("hash", ""),
+            "tags": list(snapshot.get("tags", []))[:8],
+            "top_texts": list(snapshot.get("top_texts", []))[:8],
+            "ocr_count": int(snapshot.get("ocr_count", 0)),
+            "blocker_signature": str(snapshot.get("blocker_signature", "") or ""),
+            "blockers": blockers,
+            "visible_resolve_targets": list(snapshot.get("visible_resolve_targets", []))[:8],
+            "focused_role": ax.get("focused_role", ""),
+            "focused_name": ax.get("focused_name", ""),
+            "focused_editable": bool(ax.get("focused_editable", False)),
+        }
+
+    def _snapshot_similarity(self, before: Dict[str, Any], after: Dict[str, Any]) -> Optional[float]:
+        vb = before.get("signature_vec")
+        va = after.get("signature_vec")
+        if vb is None or va is None:
+            return None
+        try:
+            return float(np.dot(vb, va) / max(1e-6, (np.linalg.norm(vb) * np.linalg.norm(va))))
+        except Exception:
+            return None
+
+    def _same_action_same_state_streak(self, action: str, before_hash: str) -> int:
+        if not before_hash:
+            return 1
+        streak = 1
+        for item in reversed(self.history[-6:]):
+            if item.get("action") != action:
+                break
+            prev_hash = ((item.get("result") or {}).get("before_state") or {}).get("hash", "")
+            if prev_hash != before_hash:
+                break
+            streak += 1
+        return streak
+
+    def _typed_text_visible(self, snapshot: Dict[str, Any], text: str) -> bool:
+        snippet = self._normalize_visible_text(text)
+        if not snippet:
+            return False
+        snippet = snippet[:48]
+        return snippet in snapshot.get("text_blob_norm", "")
+
+    def _assess_post_action(
+        self,
+        op: str,
+        params: Dict[str, Any],
+        dispatch_result: Dict[str, Any],
+        before_snapshot: Dict[str, Any],
+        after_snapshot: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        before_tags = set(before_snapshot.get("tags", []))
+        after_tags = set(after_snapshot.get("tags", []))
+        before_blocker_sig = self._blocker_signature(before_snapshot)
+        after_blocker_sig = self._blocker_signature(after_snapshot)
+        before_blocker = self._primary_blocker(before_snapshot) or {}
+        after_blocker = self._primary_blocker(after_snapshot) or {}
+        before_ax = before_snapshot.get("ax") or {}
+        after_ax = after_snapshot.get("ax") or {}
+        similarity = self._snapshot_similarity(before_snapshot, after_snapshot)
+        screen_changed = similarity is not None and similarity < NOOP_SIMILARITY_THRESHOLD
+        tags_changed = before_tags != after_tags
+        blocker_cleared = bool(before_blocker_sig) and not bool(after_blocker_sig)
+        blocker_changed = bool(before_blocker_sig and after_blocker_sig and before_blocker_sig != after_blocker_sig)
+        blocker_persisted = bool(before_blocker_sig and after_blocker_sig and before_blocker_sig == after_blocker_sig)
+        focus_changed = bool(before_ax.get("focus_hash")) and bool(after_ax.get("focus_hash")) and before_ax.get("focus_hash") != after_ax.get("focus_hash")
+        focus_became_editable = bool(after_ax.get("focused_editable")) and not bool(before_ax.get("focused_editable"))
+
+        evidence: List[str] = []
+        if screen_changed and similarity is not None:
+            evidence.append(f"screen_changed:{similarity:.3f}")
+        if tags_changed:
+            evidence.append("state_tags_changed")
+        if blocker_cleared:
+            evidence.append("blocking_overlay_cleared")
+        if blocker_changed:
+            evidence.append("blocker_changed")
+        if blocker_persisted:
+            evidence.append("blocker_still_present")
+        if str(after_blocker.get("class", "") or "") == "browser_url_suggestion_dropdown" and blocker_persisted:
+            evidence.append("browser_overlay_still_present")
+        if focus_changed:
+            evidence.append("ax_focus_changed")
+        if focus_became_editable:
+            evidence.append("ax_focus_became_editable")
+
+        verified_candidate = False
+        if op == "open_url":
+            if "phase:loading_like" in after_tags:
+                evidence.append("loading_after_open")
+            verified_candidate = (
+                screen_changed
+                or tags_changed
+                or "phase:loading_like" in after_tags
+                or ("app:browser_like" in after_tags and "app:browser_like" not in before_tags)
+            )
+        elif op == "type_text":
+            typed_text = "" if params.get("confidential") else str(params.get("text", "") or "")
+            if typed_text and typed_text[:48] and typed_text[:48].lower() in (after_ax.get("focused_value_norm") or ""):
+                evidence.append("ax_value_contains_typed")
+                verified_candidate = True
+            if typed_text and self._typed_text_visible(after_snapshot, typed_text):
+                evidence.append("typed_text_visible")
+                verified_candidate = True
+            elif params.get("confidential"):
+                verified_candidate = screen_changed or tags_changed
+                if verified_candidate:
+                    evidence.append("confidential_input_changed_state")
+        elif op == "key_seq":
+            keys = dispatch_result.get("keys") or params.get("keys") or []
+            keys_blob = ",".join(str(k).lower() for k in keys)
+            if "return" in keys_blob or "enter" in keys_blob:
+                if "phase:loading_like" in after_tags:
+                    evidence.append("loading_after_submit")
+                verified_candidate = screen_changed or tags_changed or blocker_cleared or "phase:loading_like" in after_tags
+            elif "tab" in keys_blob:
+                verified_candidate = screen_changed or tags_changed or focus_changed
+                if focus_changed:
+                    evidence.append("tab_changed_focus")
+                elif verified_candidate:
+                    evidence.append("focus_or_layout_shift_after_tab")
+            else:
+                verified_candidate = screen_changed or tags_changed or focus_changed
+        else:
+            clicked_text = self._normalize_visible_text(str(dispatch_result.get("clicked", "") or ""))
+            if clicked_text and clicked_text in before_snapshot.get("text_blob_norm", "") and clicked_text not in after_snapshot.get("text_blob_norm", ""):
+                evidence.append("clicked_text_disappeared")
+                verified_candidate = True
+            if focus_changed:
+                evidence.append("click_changed_focus")
+                verified_candidate = True
+            verified_candidate = verified_candidate or screen_changed or tags_changed or blocker_cleared or blocker_changed
+
+        if blocker_persisted and self._is_blocker_sensitive_action(op, params):
+            verified_candidate = False
+
+        return {
+            "verified_candidate": bool(verified_candidate),
+            "similarity": similarity,
+            "evidence": evidence,
+            "score": len(evidence) + (1 if verified_candidate else 0),
+            "reason": evidence[0] if evidence else "no_observable_change",
+        }
+
+    def _verify_post_action(
+        self,
+        op: str,
+        params: Dict[str, Any],
+        dispatch_result: Dict[str, Any],
+        before_snapshot: Dict[str, Any],
+        timeout_s: float = POST_ACTION_VERIFY_TIMEOUT_S,
+    ) -> Dict[str, Any]:
+        deadline = time.time() + max(0.2, float(timeout_s))
+        stable_hits = 0
+        best_assessment: Optional[Dict[str, Any]] = None
+        last_snapshot = before_snapshot
+
+        while time.time() <= deadline:
+            self._capture_state()
+            after_snapshot = self._state_snapshot()
+            last_snapshot = after_snapshot
+            assessment = self._assess_post_action(op, params, dispatch_result, before_snapshot, after_snapshot)
+            if best_assessment is None or assessment.get("score", 0) > best_assessment.get("score", 0):
+                best_assessment = dict(assessment, after_snapshot=after_snapshot)
+            if assessment.get("verified_candidate"):
+                stable_hits += 1
+                if stable_hits >= POST_ACTION_VERIFY_STABLE_HITS:
+                    return {
+                        "verified": True,
+                        "reason": assessment.get("reason", "observable_transition"),
+                        "evidence": assessment.get("evidence", []),
+                        "similarity": assessment.get("similarity"),
+                        "after_snapshot": after_snapshot,
+                    }
+            else:
+                stable_hits = 0
+            time.sleep(POST_ACTION_VERIFY_POLL_S)
+
+        best = best_assessment or {
+            "reason": "outcome_not_verified",
+            "evidence": [],
+            "similarity": self._snapshot_similarity(before_snapshot, last_snapshot),
+            "after_snapshot": last_snapshot,
+        }
+        return {
+            "verified": False,
+            "reason": best.get("reason", "outcome_not_verified"),
+            "evidence": best.get("evidence", []),
+            "similarity": best.get("similarity"),
+            "after_snapshot": best.get("after_snapshot", last_snapshot),
+        }
+
+    def _finalize_action_result(
+        self,
+        op: str,
+        params: Dict[str, Any],
+        raw_result: Dict[str, Any],
+        before_snapshot: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        result = dict(raw_result or {})
+        result.setdefault("recovery_strategy", self._action_family(op, params))
+        result["before_state"] = self._public_state_snapshot(before_snapshot)
+        result["same_action_same_state_streak"] = self._same_action_same_state_streak(op, before_snapshot.get("hash", ""))
+
+        if result.get("status") != "success":
+            after_snapshot = self._state_snapshot()
+            result["after_state"] = self._public_state_snapshot(after_snapshot)
+            result["event_applied"] = bool(result.get("event_applied", False))
+            result["outcome_verified"] = False
+            result["blocker_class"] = (self._primary_blocker(after_snapshot) or self._primary_blocker(before_snapshot) or {}).get("class")
+            result["blocker_signature"] = self._blocker_signature(after_snapshot) or self._blocker_signature(before_snapshot)
+            result["recovery_effect"] = self._recovery_effect(before_snapshot, after_snapshot)
+            failure_reason = str(result.get("error_code") or "event_dispatch_failed")
+            result["verification"] = {
+                "verified": False,
+                "reason": failure_reason.lower(),
+                "evidence": [result["recovery_effect"]] if result.get("recovery_effect") else [],
+                "similarity": self._snapshot_similarity(before_snapshot, after_snapshot),
+            }
+            if not result.get("recovery_hint"):
+                result["recovery_hint"] = self._default_blocker_recovery_hint(before_snapshot, after_snapshot)
+            return result
+
+        passive_ops = {"wait_text", "wait_any_text", "sleep", "ocr_extract", "run_llm"}
+        if op in passive_ops:
+            after_snapshot = self._state_snapshot()
+            result["after_state"] = self._public_state_snapshot(after_snapshot)
+            result["event_applied"] = True
+            result["outcome_verified"] = True
+            result["verification"] = {
+                "verified": True,
+                "reason": "passive_action_completed",
+                "evidence": [],
+                "similarity": self._snapshot_similarity(before_snapshot, after_snapshot),
+            }
+            return result
+
+        verification = self._verify_post_action(op, params, result, before_snapshot)
+        after_snapshot = verification.get("after_snapshot", before_snapshot)
+        result["after_state"] = self._public_state_snapshot(after_snapshot)
+        result["event_applied"] = True
+        result["outcome_verified"] = bool(verification.get("verified"))
+        result["blocker_class"] = (self._primary_blocker(after_snapshot) or self._primary_blocker(before_snapshot) or {}).get("class")
+        result["blocker_signature"] = self._blocker_signature(after_snapshot) or self._blocker_signature(before_snapshot)
+        result["recovery_effect"] = self._recovery_effect(before_snapshot, after_snapshot)
+        result["verification"] = {
+            "verified": bool(verification.get("verified")),
+            "reason": verification.get("reason", ""),
+            "evidence": verification.get("evidence", []),
+            "similarity": verification.get("similarity"),
+        }
+        if verification.get("verified"):
+            result["status"] = "success"
+        else:
+            result["status"] = "dispatched"
+            result["error_code"] = "OUTCOME_NOT_VERIFIED"
+            if result.get("same_action_same_state_streak", 1) > 1 and not self._blocker_signature(after_snapshot):
+                result["recovery_hint"] = "change_action_family"
+            else:
+                result["recovery_hint"] = self._default_blocker_recovery_hint(before_snapshot, after_snapshot)
+        return result
 
     def _apply_candidate(self, cand: Candidate) -> Dict[str,Any]:
         if cand.action == "click_box":
@@ -1248,27 +2282,38 @@ img {{ width:100%; height:auto; border-radius:8px; background:#f6f6f6; }}
     def _capture_state(self):
         img, _ = self.grabber.capture()
         self.last_img = img
-        self.last_ocr = ocr_image(img)
-        # truncate OCR to reduce token size (keep bigger words first)
-        self.last_ocr = sorted(self.last_ocr, key=lambda w: (-(w["box"][3]-w["box"][1]), -float(w.get("conf", 100))))[:OCR_LIMIT]
-        self._log("debug", "state.captured", {"ocr_items": len(self.last_ocr)})
+        ocr_levels = ocr_image_levels(img)
+        self.last_ocr_words = list(ocr_levels.get("words") or [])
+        self.last_ocr_lines = list(ocr_levels.get("lines") or [])
+        self.last_ocr_source = str(ocr_levels.get("source") or "")
+        self.last_ax_nodes = self._fetch_ax_nodes()
+        # Keep words for precise targeting and lines for multi-word targeting / planner context.
+        self.last_ocr_words = sorted(self.last_ocr_words, key=lambda w: (-(w["box"][3]-w["box"][1]), -float(w.get("conf", 100))))[:OCR_LIMIT]
+        self.last_ocr_lines = sorted(self.last_ocr_lines, key=lambda w: (-(w["box"][3]-w["box"][1]), -float(w.get("conf", 100))))[: max(40, min(OCR_LIMIT, 160))]
+        self.last_ocr = self.last_ocr_words
+        self._log(
+            "debug",
+            "state.captured",
+            {
+                "ocr_words": len(self.last_ocr_words),
+                "ocr_lines": len(self.last_ocr_lines),
+                "ocr_source": self.last_ocr_source,
+                "ax_nodes": len(self.last_ax_nodes),
+            },
+        )
 
     def _action_wait_any_text(self, patterns, timeout_s: int = 20):
-        import re, time
-        compiled = [re.compile(pat, re.I) for pat in patterns]
         t0 = time.time()
         while time.time() - t0 <= timeout_s:
             self._capture_state()
-            found = None
-            for w in self.last_ocr:
-                for rx in compiled:
-                    if rx.search(w["text"]):
-                        found = {"text": w["text"], "box": w["box"]}
-                        break
-                if found:
-                    break
+            found = find_text_box(self.last_ocr_words or self.last_ocr, line_items=self.last_ocr_lines, any_regex=patterns)
             if found:
-                return {"status":"success","match": found}
+                return {
+                    "status": "success",
+                    "match": {"text": found["text"], "box": found["box"]},
+                    "ocr_level": found.get("level", "word"),
+                    "targeting_source": f"ocr_{found.get('level', 'word')}",
+                }
             time.sleep(0.4)
         return {"status":"failure","error_code":"TIMEOUT_ANY","error_message": f"None matched in {patterns}"}
 
@@ -1277,7 +2322,8 @@ img {{ width:100%; height:auto; border-radius:8px; background:#f6f6f6; }}
         import re
         for pat in patterns:
             w = find_text_box(
-                self.last_ocr,
+                self.last_ocr_words or self.last_ocr,
+                line_items=self.last_ocr_lines,
                 regex=pat,
                 nth=nth,
                 prefer_bold=prefer_bold
@@ -1288,19 +2334,26 @@ img {{ width:100%; height:auto; border-radius:8px; background:#f6f6f6; }}
                     box=[int(x1), int(y1), int(x2), int(y2)],
                     click_rel=(int(cx), int(cy)),
                     action="click_any_text",
-                    note=f"pattern_used={pat}",
+                    note=f"pattern_used={pat} level={w.get('level', 'word')}",
                 )
                 x_abs,y_abs = self.grabber.to_abs(cx,cy)
                 if not CLICK_ENABLED or not self._xdotool_ok:
                     return {"status":"failure","error_code":"CLICK_DISABLED_OR_MISSING_XDOTOOL"}
                 _safe_run(["xdotool","mousemove","--sync",str(x_abs),str(y_abs)])
                 _safe_run(["xdotool","click","1"])
-                return {"status":"success","clicked": w["text"], "box": w["box"], "pattern_used": pat}
+                return {
+                    "status": "success",
+                    "clicked": w["text"],
+                    "box": w["box"],
+                    "pattern_used": pat,
+                    "ocr_level": w.get("level", "word"),
+                    "targeting_source": f"ocr_{w.get('level', 'word')}",
+                }
         return {"status":"failure","error_code":"ELEMENT_NOT_FOUND","error_message": f"No pattern matched: {patterns}"}
 
     def _action_click_near_text(self, anchor_regex: str, dx: int = 0, dy: int = 0):
         import re
-        w = find_text_box(self.last_ocr, regex=anchor_regex)
+        w = find_text_box(self.last_ocr_words or self.last_ocr, line_items=self.last_ocr_lines, regex=anchor_regex)
         if not w:
             return {"status":"failure","error_code":"ANCHOR_NOT_FOUND","error_message": anchor_regex}
         x1,y1,x2,y2 = w["box"]; cx,cy = (x1+x2)//2, (y1+y2)//2
@@ -1313,14 +2366,21 @@ img {{ width:100%; height:auto; border-radius:8px; background:#f6f6f6; }}
             box=[click_x - 12, click_y - 12, click_x + 12, click_y + 12],
             click_rel=(click_x, click_y),
             action="click_near_text",
-            note=f"anchor={w.get('text','')} offset=[{dx},{dy}]",
+            note=f"anchor={w.get('text','')} level={w.get('level', 'word')} offset=[{dx},{dy}]",
         )
         x_abs,y_abs = self.grabber.to_abs(click_x, click_y)
         if not CLICK_ENABLED or not self._xdotool_ok:
             return {"status":"failure","error_code":"CLICK_DISABLED_OR_MISSING_XDOTOOL"}
         _safe_run(["xdotool","mousemove","--sync",str(x_abs),str(y_abs)])
         _safe_run(["xdotool","click","1"])
-        return {"status":"success","anchor": w["text"], "anchor_box": w["box"], "offset": [dx,dy]}
+        return {
+            "status": "success",
+            "anchor": w["text"],
+            "anchor_box": w["box"],
+            "offset": [dx, dy],
+            "anchor_level": w.get("level", "word"),
+            "targeting_source": f"ocr_{w.get('level', 'word')}",
+        }
 
     def _action_click_box(self, box):
         try:
@@ -1354,23 +2414,44 @@ img {{ width:100%; height:auto; border-radius:8px; background:#f6f6f6; }}
         regex: Optional[str] = None, nth: int = 0, prefer_bold: bool = False,
         fuzzy_text: Optional[str] = None, fuzzy_threshold: Optional[float] = None
     ):
-        if not self.last_ocr:
+        if not (self.last_ocr_words or self.last_ocr_lines or self.last_ocr):
             return {"status": "failure", "error_code": "NO_OCR", "error_message": "No OCR results yet"}
-        w = find_text_box(self.last_ocr, regex=regex, nth=nth, prefer_bold=prefer_bold,
+        w = find_text_box(self.last_ocr_words or self.last_ocr, line_items=self.last_ocr_lines, regex=regex, nth=nth, prefer_bold=prefer_bold,
                           fuzzy_text=fuzzy_text, fuzzy_threshold=fuzzy_threshold)
         if not w:
             return {"status": "failure", "error_code": "ELEMENT_NOT_FOUND",
                     "error_message": f"Regex '{regex}' not found"}
         x1,y1,x2,y2 = w["box"]; cx,cy = (x1+x2)//2, (y1+y2)//2
+        self._debug_save_click_crop(
+            box=[int(x1), int(y1), int(x2), int(y2)],
+            click_rel=(int(cx), int(cy)),
+            action="click_text",
+            note=f"level={w.get('level', 'word')}",
+        )
         x_abs,y_abs = self.grabber.to_abs(cx,cy)
         if not CLICK_ENABLED or not self._xdotool_ok:
             return {"status": "failure", "error_code": "CLICK_DISABLED_OR_MISSING_XDOTOOL",
                     "error_message": "CLICK_ENABLED=0 or xdotool missing"}
         _safe_run(["xdotool","mousemove","--sync",str(x_abs),str(y_abs)])
         _safe_run(["xdotool","click","1"])
-        return {"status": "success", "clicked": w["text"], "box": w["box"]}
+        return {
+            "status": "success",
+            "clicked": w["text"],
+            "box": w["box"],
+            "ocr_level": w.get("level", "word"),
+            "targeting_source": f"ocr_{w.get('level', 'word')}",
+        }
 
     def _action_type_text(self, text: str, confidential: bool = False):
+        ax = self._state_snapshot().get("ax") or {}
+        if ax.get("available") and not ax.get("focused_editable"):
+            return {
+                "status": "failure",
+                "error_code": "FOCUS_NOT_EDITABLE",
+                "error_message": f"Focused AX node is not editable ({ax.get('focused_role') or 'unknown'})",
+                "event_applied": False,
+                "recovery_hint": "refocus_editable_field",
+            }
         # Allow ${VAR} substitution from env/ctx
         def repl(m): 
             key = m.group(1)
@@ -1441,13 +2522,20 @@ img {{ width:100%; height:auto; border-radius:8px; background:#f6f6f6; }}
         t0 = time.time()
         while time.time() - t0 <= timeout_s:
             self._capture_state()
-            if find_text_box(self.last_ocr, regex=regex):
-                return {"status": "success", "regex": regex}
+            match = find_text_box(self.last_ocr_words or self.last_ocr, line_items=self.last_ocr_lines, regex=regex)
+            if match:
+                return {
+                    "status": "success",
+                    "regex": regex,
+                    "ocr_level": match.get("level", "word"),
+                    "targeting_source": f"ocr_{match.get('level', 'word')}",
+                }
             time.sleep(0.4)
         return {"status": "failure", "error_code": "TIMEOUT", "error_message": f"wait_text timeout for '{regex}'"}
 
     def _action_ocr_extract(self, save_as: str):
-        text = " ".join(w["text"] for w in self.last_ocr)
+        text_items = self.last_ocr_lines or self.last_ocr_words or self.last_ocr
+        text = "\n".join(w["text"] for w in text_items)
         self.ctx[save_as] = text
         return {"status": "success", "var": save_as, "len": len(text)}
 
@@ -1507,9 +2595,14 @@ img {{ width:100%; height:auto; border-radius:8px; background:#f6f6f6; }}
         while step < MAX_STEPS:
             # Monotonic trace id for HTML grid + dumps
             self.trace_idx += 1
+            self._last_click_debug = None
             # 1) Observe
             self._capture_state()
-            ocr_min = [{"text": w["text"], "box": w["box"], "conf": w["conf"]} for w in self.last_ocr]
+            pre_action_snapshot = self._state_snapshot()
+            public_state = self._public_state_snapshot(pre_action_snapshot)
+            public_state["recovery_options"] = self._recovery_options(pre_action_snapshot)
+            public_state["recent_blocker_attempts"] = self._recent_blocker_attempts(public_state.get("blocker_signature", ""))[-6:]
+            ocr_min: List[Dict[str, Any]] = []
 
             # 2) Report
             # Optionally attach a compressed screenshot so the planner can use a vision model.
@@ -1528,11 +2621,23 @@ img {{ width:100%; height:auto; border-radius:8px; background:#f6f6f6; }}
 
             try:
                 # OCR elements (boxes are image-relative)
-                max_ocr_elems = int(os.environ.get("PLANNER_MAX_OCR_ELEMENTS", "200"))
-                max_ocr_elems = max(0, min(400, max_ocr_elems))
-                for w in self.last_ocr[:max_ocr_elems]:
+                max_ocr_line_elems = int(os.environ.get("PLANNER_MAX_OCR_LINE_ELEMENTS", "80"))
+                max_ocr_word_elems = int(os.environ.get("PLANNER_MAX_OCR_WORD_ELEMENTS", "140"))
+                max_ocr_line_elems = max(0, min(200, max_ocr_line_elems))
+                max_ocr_word_elems = max(0, min(300, max_ocr_word_elems))
+                for w in self.last_ocr_lines[:max_ocr_line_elems]:
+                    ocr_min.append({"text": w["text"], "box": w["box"], "conf": w["conf"], "level": "line"})
                     ui_elements.append({
-                        "source": "ocr",
+                        "source": "ocr_line",
+                        "text": w.get("text", ""),
+                        "box": w.get("box", [0, 0, 0, 0]),
+                        "score": float(w.get("conf", 0.0)) / 100.0 if float(w.get("conf", 0.0)) > 1.0 else float(w.get("conf", 0.0)),
+                        "role": None,
+                    })
+                for w in self.last_ocr_words[:max_ocr_word_elems]:
+                    ocr_min.append({"text": w["text"], "box": w["box"], "conf": w["conf"], "level": "word"})
+                    ui_elements.append({
+                        "source": "ocr_word",
                         "text": w.get("text", ""),
                         "box": w.get("box", [0, 0, 0, 0]),
                         "score": float(w.get("conf", 0.0)) / 100.0 if float(w.get("conf", 0.0)) > 1.0 else float(w.get("conf", 0.0)),
@@ -1553,12 +2658,28 @@ img {{ width:100%; height:auto; border-radius:8px; background:#f6f6f6; }}
                             "score": float(d.get("score", 0.0)),
                             "role": None,
                         })
+
+                if self.last_ax_nodes:
+                    max_ax_elems = int(os.environ.get("PLANNER_MAX_AX_ELEMENTS", "80"))
+                    max_ax_elems = max(0, min(200, max_ax_elems))
+                    for node in self.last_ax_nodes[:max_ax_elems]:
+                        box = node.get("box", [0, 0, 0, 0])
+                        if not isinstance(box, list) or len(box) != 4:
+                            box = [0, 0, 0, 0]
+                        ui_elements.append({
+                            "source": "ax",
+                            "text": self._ax_text(node) or self._ax_value_text(node) or str(node.get("role", "") or ""),
+                            "box": [int(v) for v in box],
+                            "score": float(node.get("score", 0.95) or 0.95),
+                            "role": str(node.get("role", "") or None) if node.get("role") else None,
+                        })
             except Exception as e:
                 self._log("warn", "planner.ui_elements.build_failed", {"error": str(e)})
 
             payload = {
                 "goal": AGENT_GOAL,
                 "task_history": self.history[-HISTORY_WINDOW:],
+                "current_state": public_state,
                 "ocr_results": ocr_min,
                 "ui_elements": ui_elements,
                 "screenshot_b64": screenshot_b64,
@@ -1579,6 +2700,8 @@ img {{ width:100%; height:auto; border-radius:8px; background:#f6f6f6; }}
                         "goal_len": len(AGENT_GOAL or ""),
                         "task_history_n": len(payload.get("task_history") or []),
                         "ocr_results_n": len(payload.get("ocr_results") or []),
+                        "ocr_line_results_n": len(self.last_ocr_lines),
+                        "ocr_word_results_n": len(self.last_ocr_words),
                         "ui_elements_n": len(payload.get("ui_elements") or []),
                         "has_screenshot": bool(payload.get("screenshot_b64")),
                         "screenshot_b64_len": len(payload.get("screenshot_b64") or "") if payload.get("screenshot_b64") else 0,
@@ -1596,75 +2719,165 @@ img {{ width:100%; height:auto; border-radius:8px; background:#f6f6f6; }}
             reasoning = resp.get("reasoning","")
             completed = bool(resp.get("completed", False))
             self._log("info","planner.decision",{"action": op, "params": params, "why": reasoning})
+            planner_op = op
+            planner_params = dict(params)
 
             # Trace: save the pre-action frame (what the planner saw)
             frame_path = ""
             if self.trace_enabled and self.last_img is not None:
-                try:
-                    q = max(25, min(95, int(TRACE_FRAME_QUALITY)))
-                    frame_path = os.path.join(self.run_dir, f"{self.trace_idx:05d}_{op}_frame.jpg")
-                    cv2.imwrite(frame_path, self.last_img, [int(cv2.IMWRITE_JPEG_QUALITY), q])
-                except Exception as e:
-                    self._log("warn", "trace.frame_save_failed", {"error": str(e)})
+                frame_path = self._save_trace_frame(op, "frame")
 
             # 3) Act
             result = {"status":"failure","error_code":"UNKNOWN_ACTION","error_message": op}
             try:
-                # Intercept brittle planner steps with a consensus step first
-                brittle = self._detect_brittle_intent(op, params)
-                if brittle:
-                    intent, verify_patterns = brittle
-                    self._log("info","consensus.invoke", {"intent": intent, "verify": verify_patterns})
-                    res = self._consensus_step(intent=intent, verify_patterns=verify_patterns)
-                    if res.get("status") == "success":
-                        result = {"status":"success","via":"consensus","picked": res.get("picked")}
-                        # After success, optionally insert a short sleep to stabilize UI
-                        time.sleep(0.3)
-                        # record and continue to next loop without invoking the brittle action itself
-                        self.history.append({"action": f"consensus:{intent}", "parameters": {"verify": verify_patterns}, "result": result})
-                        self._log("info","action.result", {"action": f"consensus:{intent}", "result": result})
-                        step += 1
-                        time.sleep(0.6)
-                        continue
-                    else:
-                        self._log("warn","consensus.failed", {"intent": intent, "reason": res.get("reason")})
+                policy = self._blocker_policy_directive(op, params, pre_action_snapshot)
+                if policy.get("decision") == "override":
+                    op = str(policy.get("action") or op)
+                    params = self._canonicalize_params(op, policy.get("params") or {})
+                    override_reason = str(policy.get("reason") or "")
+                    executed_strategy = str(policy.get("strategy") or self._action_family(op, params))
+                    policy_blocker = policy.get("blocker") or {}
+                    self._log(
+                        "info",
+                        "executor.override",
+                        {
+                            "from_action": planner_op,
+                            "to_action": op,
+                            "reason": override_reason,
+                            "blocker_class": policy_blocker.get("class"),
+                            "strategy": executed_strategy,
+                        },
+                    )
+                else:
+                    override_reason = ""
+                    executed_strategy = str(policy.get("strategy") or self._action_family(op, params))
+                    policy_blocker = policy.get("blocker") or {}
 
-                if op == "done" or op == "end_task":
-                    self._log("info", "task.complete", {"reason": params.get("reason","planner requested end")})
-                    break
-                if op == "open_url":         result = self._action_open_url(**params)
-                elif op == "wait_text":      result = self._action_wait_text(**params)
-                elif op == "wait_any_text":  result = self._action_wait_any_text(**params)
-                elif op == "click_text":     result = self._action_click_text(**params)
-                elif op == "click_any_text": result = self._action_click_any_text(**params)
-                elif op == "click_near_text":result = self._action_click_near_text(**params)
-                elif op == "click_box":      result = self._action_click_box(**params)
-                elif op == "type_text":      result = self._action_type_text(**params)
-                elif op == "key_seq":        result = self._action_key_seq(**params)
-                elif op == "sleep":          result = self._action_sleep(**params)
-                elif op == "ocr_extract":    result = self._action_ocr_extract(**params)
-                elif op == "run_llm":        result = self._action_run_llm(**params)
-                # Debounce after successful clicks
-                if op in ("click_text","click_any_text","click_near_text") and result.get("status") == "success":
-                    time.sleep(0.25)
+                guard_result = self._executor_guard_result(op, params, pre_action_snapshot)
+                if guard_result is not None:
+                    result = self._finalize_action_result(op, params, guard_result, pre_action_snapshot)
+                else:
+                    # Intercept brittle planner steps with a consensus step first
+                    brittle = self._detect_brittle_intent(op, params)
+                    if brittle:
+                        intent, verify_patterns = brittle
+                        self._log("info","consensus.invoke", {"intent": intent, "verify": verify_patterns})
+                        res = self._consensus_step(intent=intent, verify_patterns=verify_patterns)
+                        if res.get("status") == "success":
+                            after_snapshot = self._state_snapshot()
+                            result = {
+                                "status":"success",
+                                "via":"consensus",
+                                "picked": res.get("picked"),
+                                "event_applied": True,
+                                "outcome_verified": True,
+                                "planner_requested_action": planner_op,
+                                "planner_requested_parameters": planner_params,
+                                "executed_action": f"consensus:{intent}",
+                                "executed_parameters": {"verify": verify_patterns},
+                                "recovery_strategy": "consensus",
+                                "before_state": self._public_state_snapshot(pre_action_snapshot),
+                                "after_state": self._public_state_snapshot(after_snapshot),
+                                "same_action_same_state_streak": self._same_action_same_state_streak(f"consensus:{intent}", pre_action_snapshot.get("hash", "")),
+                                "verification": {
+                                    "verified": True,
+                                    "reason": "consensus_verified_transition",
+                                    "evidence": list(verify_patterns),
+                                    "similarity": self._snapshot_similarity(pre_action_snapshot, after_snapshot),
+                                },
+                            }
+                            # After success, optionally insert a short sleep to stabilize UI
+                            time.sleep(0.3)
+                            post_frame_path = self._save_trace_frame(f"consensus_{intent}", "post")
+                            # record and continue to next loop without invoking the brittle action itself
+                            self.history.append({"action": f"consensus:{intent}", "parameters": {"verify": verify_patterns}, "result": result})
+                            self._log("info","action.result", {"action": f"consensus:{intent}", "result": result})
+                            crop_overlay = (self._last_click_debug or {}).get("overlay_path") if self._last_click_debug else ""
+                            self._trace_append(
+                                {
+                                    "idx": self.trace_idx,
+                                    "ts": now_utc_iso(),
+                                    "decision": {"action": f"consensus:{intent}", "parameters": {"verify": verify_patterns}, "reasoning": reasoning, "completed": completed},
+                                    "result": result,
+                                    "frame_path": frame_path,
+                                    "post_frame_path": post_frame_path,
+                                    "crop_overlay_path": crop_overlay,
+                                    "ocr_results_n": len(ocr_min),
+                                    "ocr_line_results_n": len(self.last_ocr_lines),
+                                    "ocr_word_results_n": len(self.last_ocr_words),
+                                    "ui_elements_n": len(ui_elements),
+                                    "screenshot_b64_len": len(screenshot_b64) if screenshot_b64 else 0,
+                                }
+                            )
+                            self._trace_render_html()
+                            step += 1
+                            time.sleep(0.6)
+                            continue
+                        else:
+                            self._log("warn","consensus.failed", {"intent": intent, "reason": res.get("reason")})
+
+                    if op == "done" or op == "end_task":
+                        self._log("info", "task.complete", {"reason": params.get("reason","planner requested end")})
+                        break
+                    if op == "open_url":         result = self._action_open_url(**params)
+                    elif op == "wait_text":      result = self._action_wait_text(**params)
+                    elif op == "wait_any_text":  result = self._action_wait_any_text(**params)
+                    elif op == "click_text":     result = self._action_click_text(**params)
+                    elif op == "click_any_text": result = self._action_click_any_text(**params)
+                    elif op == "click_near_text":result = self._action_click_near_text(**params)
+                    elif op == "click_box":      result = self._action_click_box(**params)
+                    elif op == "type_text":      result = self._action_type_text(**params)
+                    elif op == "key_seq":        result = self._action_key_seq(**params)
+                    elif op == "sleep":          result = self._action_sleep(**params)
+                    elif op == "ocr_extract":    result = self._action_ocr_extract(**params)
+                    elif op == "run_llm":        result = self._action_run_llm(**params)
+                    result = self._finalize_action_result(op, params, result, pre_action_snapshot)
+                    # Debounce after dispatched or verified clicks
+                    if op in ("click_text","click_any_text","click_near_text") and result.get("event_applied"):
+                        time.sleep(0.25)
+
+                result["planner_requested_action"] = planner_op
+                result["planner_requested_parameters"] = planner_params
+                result["executed_action"] = op
+                result["executed_parameters"] = params
+                result["recovery_strategy"] = result.get("recovery_strategy") or executed_strategy
+                if override_reason:
+                    result["executor_override_reason"] = override_reason
+                    result["executor_override_from"] = {"action": planner_op, "parameters": planner_params}
+                if policy_blocker:
+                    result.setdefault("blocker_class", policy_blocker.get("class"))
+                    result.setdefault("blocker_signature", policy_blocker.get("signature"))
             except Exception as e:
-                result = {"status":"failure","error_code":"EXCEPTION","error_message": str(e)}
+                result = self._finalize_action_result(
+                    op,
+                    params,
+                    {"status":"failure","error_code":"EXCEPTION","error_message": str(e), "event_applied": False},
+                    pre_action_snapshot,
+                )
+                result["planner_requested_action"] = planner_op
+                result["planner_requested_parameters"] = planner_params
+                result["executed_action"] = op
+                result["executed_parameters"] = params
 
             # 4) Record
             self.history.append({"action": op, "parameters": params, "result": result})
             self._log("info","action.result",{"action": op, "result": result})
 
             # 5) Trace record + regenerate HTML (last N)
+            post_frame_path = self._save_trace_frame(op, "post")
             crop_overlay = (self._last_click_debug or {}).get("overlay_path") if self._last_click_debug else ""
             self._trace_append(
                 {
                     "idx": self.trace_idx,
                     "ts": now_utc_iso(),
-                    "decision": {"action": op, "parameters": params, "reasoning": reasoning, "completed": completed},
+                    "decision": {"action": planner_op, "parameters": planner_params, "reasoning": reasoning, "completed": completed},
                     "result": result,
                     "frame_path": frame_path,
+                    "post_frame_path": post_frame_path,
                     "crop_overlay_path": crop_overlay,
                     "ocr_results_n": len(ocr_min),
+                    "ocr_line_results_n": len(self.last_ocr_lines),
+                    "ocr_word_results_n": len(self.last_ocr_words),
                     "ui_elements_n": len(ui_elements),
                     "screenshot_b64_len": len(screenshot_b64) if screenshot_b64 else 0,
                 }

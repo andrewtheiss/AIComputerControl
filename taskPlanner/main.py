@@ -59,6 +59,7 @@ class OCRResult(BaseModel):
     text: str
     box: List[int]
     conf: float
+    level: Optional[str] = None
 
 class HistoryItem(BaseModel):
     action: str
@@ -70,7 +71,7 @@ class UIElement(BaseModel):
     A compact, screen-space UI element description produced by the executor.
     Coordinates are image-relative [x1,y1,x2,y2] for the current screenshot frame.
     """
-    source: str  # "ocr" | "det" | "ax"
+    source: str  # "ocr_word" | "ocr_line" | "det" | "ax"
     text: str
     box: List[int]
     score: float
@@ -79,6 +80,7 @@ class UIElement(BaseModel):
 class PlannerRequest(BaseModel):
     goal: str
     task_history: List[HistoryItem] = Field(default_factory=list)
+    current_state: Dict[str, Any] = Field(default_factory=dict)
     ocr_results: List[OCRResult] = Field(default_factory=list)
     ui_elements: List[UIElement] = Field(default_factory=list)
     screenshot_b64: Optional[str] = None
@@ -125,14 +127,28 @@ Rules:
 
 Use only the actions announced by the caller.
 Leverage the full VM access: open and interact with browsers (e.g., Firefox), terminals, text editors, or any other apps as needed to achieve the GOAL.
-If a previous action failed (see last history.result), adapt with alternatives like waiting, retrying with different inputs/regex, switching apps, or using terminal commands for file ops.
+Treat any previous action with status=dispatched, status=failure, or outcome_verified=false as unresolved. It is NOT a soft success.
+Do not assume a click, keypress, or typing step changed the UI unless history says outcome_verified=true or the current OCR/screenshot clearly proves the new state.
+If same_action_same_state_streak is greater than 1 or verification evidence says no_observable_change / OUTCOME_NOT_VERIFIED, do not repeat the same action family again immediately. Force a strategy change.
+If current_state.tags or recent history indicates any blocker:* tag, clear that blocker before normal goal progression. Do not continue with task-level actions while blocker tags remain present.
+Common blockers include browser suggestion overlays, browser chrome dropdowns, modals, cookie banners, permission prompts, session restore prompts, and similar interruptions.
+Distinguish browser page content from browser chrome. Suggestion overlays, URL bar dropdowns, browser dialogs, and session restore are not the destination page.
+Use current_state.blockers as the source of truth when available. Respect blocker class, scope, visible resolve_targets, allow_page_click_through, and suggested_strategies.
+If a blocker exposes visible resolve_targets, prefer those over generic recovery guesses.
+If a blocker's recovery options show prior attempts for a strategy, do not keep reusing that strategy unless the state clearly changed.
+If blocker scope is browser_chrome and allow_page_click_through=true, a click on visible page content may be a valid dual-purpose move that both dismisses the chrome blocker and progresses the task.
+If blocker scope is browser_page, page_overlay, or modal, do not assume underlying page targets are legal until the blocker is resolved or a visible dual-purpose target explicitly indicates otherwise.
+When current_state or history exposes focused_role / focused_name / focused_editable, use that as strong evidence for whether typing or keyboard navigation is appropriate.
+Do not type unless focus is likely correct for the intended field. If focus is ambiguous, first refocus or verify it.
+Do not press Enter unless focus or the visible state strongly supports submit/search behavior. Avoid Enter when browser chrome or overlays may have focus.
 Never reference UI elements not present in OCR or current state.
 For web tasks, open browser if not already, navigate URLs, use search bars, click links/buttons via text matches or positions.
 For file operations, prefer terminal (e.g., echo, cat, touch) or open a text editor like gedit/vi to create/edit/save files.
 Handle interruptions like dialogs, popups, or errors by reading OCR text and responding appropriately (e.g., click 'OK', close window, or adjust strategy).
-After major actions (e.g., navigation, app switch), insert short sleep(0.5-1.5s) and confirm state with wait_any_text() or similar before proceeding.
+After major actions (e.g., navigation, app switch, dismissing popups), insert short sleep(0.5-1.5s) and confirm state with wait_any_text() or similar before proceeding.
 For comparisons or data collection (e.g., prices), track info mentally across steps; use files or terminal output if needed for persistence.
 If matching UI by text, use synonyms/variations with wait_any_text() or click_any_text(); for icons, use click_near_text() with anchors.
+If OCR or state is ambiguous, prefer verification or recovery actions over confident progression.
 Prioritize efficient paths: use keyboard shortcuts only after confirming focus; switch between apps/windows as required."""
 
 def _tool_specs_for_actions(actions: List[str]) -> str:
@@ -152,12 +168,68 @@ def _tool_specs_for_actions(actions: List[str]) -> str:
                 blocks.append(f"## {name}\n(No docstring.)")
     return "\n\n".join(blocks) if blocks else "(No tool specs available.)"
 
+def _format_history_item(h: HistoryItem) -> str:
+    result = h.result or {}
+    status = result.get("status", "unknown")
+    verification = result.get("verification") or {}
+    before_state = result.get("before_state") or {}
+    after_state = result.get("after_state") or {}
+    evidence = ", ".join((verification.get("evidence") or [])[:3])
+    parts = [f"status={status}"]
+    if "event_applied" in result:
+        parts.append(f"event_applied={result.get('event_applied')}")
+    if "outcome_verified" in result:
+        parts.append(f"outcome_verified={result.get('outcome_verified')}")
+    if result.get("same_action_same_state_streak") is not None:
+        parts.append(f"same_state_streak={result.get('same_action_same_state_streak')}")
+    if result.get("blocker_class"):
+        parts.append(f"blocker_class={result.get('blocker_class')}")
+    if result.get("recovery_strategy"):
+        parts.append(f"recovery_strategy={result.get('recovery_strategy')}")
+    if result.get("recovery_effect"):
+        parts.append(f"recovery_effect={result.get('recovery_effect')}")
+    if before_state.get("tags"):
+        parts.append(f"before_tags={before_state.get('tags')}")
+    if after_state.get("tags"):
+        parts.append(f"after_tags={after_state.get('tags')}")
+    if before_state.get("focused_role") or before_state.get("focused_name"):
+        parts.append(f"before_focus={before_state.get('focused_role') or before_state.get('focused_name')}")
+    if after_state.get("focused_role") or after_state.get("focused_name"):
+        parts.append(f"after_focus={after_state.get('focused_role') or after_state.get('focused_name')}")
+    if verification.get("reason"):
+        parts.append(f"verification={verification.get('reason')}")
+    if evidence:
+        parts.append(f"evidence={evidence}")
+    if result.get("error_code"):
+        parts.append(f"error_code={result.get('error_code')}")
+    return f"- {h.action}({h.parameters}) => " + "; ".join(parts)
+
+def _last_unresolved_history_item(history: List[HistoryItem]) -> str:
+    for h in reversed(history or []):
+        result = h.result or {}
+        if result.get("status") != "success" or result.get("outcome_verified") is False:
+            return _format_history_item(h)
+    return "None."
+
 def make_user_prompt(req: PlannerRequest) -> str:
-    hist = "\n".join(
-        f"- {h.action}({h.parameters}) => {h.result.get('status')}"
-        for h in req.task_history[-5:]
-    ) or "No prior actions."
-    ocr = "\n".join(f"- {r.text} @ {r.box} (conf={int(r.conf)})" for r in req.ocr_results[:300]) or "No OCR text."
+    hist = "\n".join(_format_history_item(h) for h in req.task_history[-5:]) or "No prior actions."
+    cur_state = req.current_state or {}
+    blockers = [str(tag) for tag in (cur_state.get("tags") or []) if str(tag).startswith("blocker:")]
+    blocker_details = cur_state.get("blockers") or []
+    recovery_options = cur_state.get("recovery_options") or []
+    recent_blocker_attempts = cur_state.get("recent_blocker_attempts") or []
+    visible_resolve_targets = cur_state.get("visible_resolve_targets") or []
+    last_unresolved = _last_unresolved_history_item(req.task_history)
+    cur_state_line = (
+        f"hash={cur_state.get('hash','')}, blocker_signature={cur_state.get('blocker_signature','')}, "
+        f"tags={cur_state.get('tags', [])}, top_texts={cur_state.get('top_texts', [])}, "
+        f"focused_role={cur_state.get('focused_role','')}, focused_name={cur_state.get('focused_name','')}, focused_editable={cur_state.get('focused_editable', False)}"
+        if cur_state else "No executor state summary."
+    )
+    ocr = "\n".join(
+        f"- [{r.level or 'ocr'}] {r.text} @ {r.box} (conf={int(r.conf)})"
+        for r in req.ocr_results[:300]
+    ) or "No OCR text."
     elems = "\n".join(
         f"- [{e.source}{'/' + e.role if e.role else ''}] {e.text} @ {e.box} (score={e.score:.2f})"
         for e in req.ui_elements[:200]
@@ -169,6 +241,13 @@ def make_user_prompt(req: PlannerRequest) -> str:
         f"GOAL:\n{req.goal}\n\n"
         f"AVAILABLE_ACTIONS: {actions}\n\n"
         f"HAS_SCREENSHOT: {has_shot}\n\n"
+        f"CURRENT_STATE:\n{cur_state_line}\n\n"
+        f"ACTIVE_BLOCKERS:\n{blockers or []}\n\n"
+        f"BLOCKER_DETAILS:\n{json.dumps(blocker_details, ensure_ascii=False, indent=2) if blocker_details else '[]'}\n\n"
+        f"VISIBLE_RESOLVE_TARGETS:\n{json.dumps(visible_resolve_targets, ensure_ascii=False, indent=2) if visible_resolve_targets else '[]'}\n\n"
+        f"RECOVERY_OPTIONS:\n{json.dumps(recovery_options, ensure_ascii=False, indent=2) if recovery_options else '[]'}\n\n"
+        f"RECENT_BLOCKER_ATTEMPTS:\n{json.dumps(recent_blocker_attempts, ensure_ascii=False, indent=2) if recent_blocker_attempts else '[]'}\n\n"
+        f"LAST_UNRESOLVED_ACTION:\n{last_unresolved}\n\n"
         f"RECENT_HISTORY:\n{hist}\n\n"
         f"CURRENT_OCR:\n{ocr}\n\n"
         f"UI_ELEMENTS (image-relative boxes):\n{elems}\n\n"
