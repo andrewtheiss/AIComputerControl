@@ -66,6 +66,8 @@ def click_text(regex: str, nth: int = 0, prefer_bold: bool = False) -> str:
       - Multi-word labels can match a whole OCR line; use the visible phrase directly.
       - If blocker details indicate allow_page_click_through=true, a visible page target
         can be a valid dual-purpose click that dismisses browser chrome and progresses.
+      - Avoid tiny chrome glyph targets like a bare tab-close 'x' when a larger visible
+        blocker-resolve control exists on the page.
     """
     ...
 

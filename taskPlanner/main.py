@@ -31,6 +31,10 @@ LOG_DECISIONS = os.getenv("PLANNER_LOG_DECISIONS", "1").strip() == "1"
 LOG_LLM_PROMPT = os.getenv("PLANNER_LOG_LLM_PROMPT", "0").strip() == "1"   # may include OCR/history
 LOG_LLM_OUTPUT = os.getenv("PLANNER_LOG_LLM_OUTPUT", "0").strip() == "1"   # raw model text (truncated)
 LOG_TRUNC_CHARS = int(os.getenv("PLANNER_LOG_TRUNC_CHARS", "1200"))
+PROMPT_HISTORY_LIMIT = max(1, int(os.getenv("PLANNER_PROMPT_HISTORY_LIMIT", "4")))
+PROMPT_OCR_LIMIT = max(0, int(os.getenv("PLANNER_PROMPT_OCR_LIMIT", "120")))
+PROMPT_UI_LIMIT = max(0, int(os.getenv("PLANNER_PROMPT_UI_LIMIT", "80")))
+PLANNER_LM_SESSION_ENABLED = os.getenv("PLANNER_LM_SESSION_ENABLED", "1").strip() == "1"
 
 # Optional request dumping (sanitized JSON + decoded screenshot file)
 DUMP_DIR = os.getenv("PLANNER_DUMP_REQUESTS_DIR", "").strip()
@@ -85,6 +89,7 @@ class PlannerRequest(BaseModel):
     ui_elements: List[UIElement] = Field(default_factory=list)
     screenshot_b64: Optional[str] = None
     screenshot_mime: str = "image/jpeg"
+    planner_session_id: Optional[str] = None
     available_actions: List[str] = Field(default_factory=list)
 
 class PlannerResponse(BaseModel):
@@ -138,6 +143,8 @@ If a blocker exposes visible resolve_targets, prefer those over generic recovery
 If a blocker's recovery options show prior attempts for a strategy, do not keep reusing that strategy unless the state clearly changed.
 If blocker scope is browser_chrome and allow_page_click_through=true, a click on visible page content may be a valid dual-purpose move that both dismisses the chrome blocker and progresses the task.
 If blocker scope is browser_page, page_overlay, or modal, do not assume underlying page targets are legal until the blocker is resolved or a visible dual-purpose target explicitly indicates otherwise.
+For browser_session_restore, strongly prefer large page-level controls like 'Start New Session' or 'Restore Session'. Do not chase tiny tab-strip close buttons or small chrome glyphs if a page CTA is visible.
+Avoid tiny browser-chrome OCR targets such as bare 'x' or '×' unless there is no better visible alternative and the current blocker scope explicitly requires browser chrome interaction.
 When current_state or history exposes focused_role / focused_name / focused_editable, use that as strong evidence for whether typing or keyboard navigation is appropriate.
 Do not type unless focus is likely correct for the intended field. If focus is ambiguous, first refocus or verify it.
 Do not press Enter unless focus or the visible state strongly supports submit/search behavior. Avoid Enter when browser chrome or overlays may have focus.
@@ -211,8 +218,14 @@ def _last_unresolved_history_item(history: List[HistoryItem]) -> str:
             return _format_history_item(h)
     return "None."
 
+def _json_compact(obj: Any) -> str:
+    try:
+        return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        return json.dumps(str(obj), ensure_ascii=False)
+
 def make_user_prompt(req: PlannerRequest) -> str:
-    hist = "\n".join(_format_history_item(h) for h in req.task_history[-5:]) or "No prior actions."
+    hist = "\n".join(_format_history_item(h) for h in req.task_history[-PROMPT_HISTORY_LIMIT:]) or "No prior actions."
     cur_state = req.current_state or {}
     blockers = [str(tag) for tag in (cur_state.get("tags") or []) if str(tag).startswith("blocker:")]
     blocker_details = cur_state.get("blockers") or []
@@ -228,11 +241,11 @@ def make_user_prompt(req: PlannerRequest) -> str:
     )
     ocr = "\n".join(
         f"- [{r.level or 'ocr'}] {r.text} @ {r.box} (conf={int(r.conf)})"
-        for r in req.ocr_results[:300]
+        for r in req.ocr_results[:PROMPT_OCR_LIMIT]
     ) or "No OCR text."
     elems = "\n".join(
         f"- [{e.source}{'/' + e.role if e.role else ''}] {e.text} @ {e.box} (score={e.score:.2f})"
-        for e in req.ui_elements[:200]
+        for e in req.ui_elements[:PROMPT_UI_LIMIT]
     ) or "No UI elements."
     actions = ", ".join(req.available_actions) or "[]"
     tool_specs = _tool_specs_for_actions(req.available_actions)
@@ -243,10 +256,10 @@ def make_user_prompt(req: PlannerRequest) -> str:
         f"HAS_SCREENSHOT: {has_shot}\n\n"
         f"CURRENT_STATE:\n{cur_state_line}\n\n"
         f"ACTIVE_BLOCKERS:\n{blockers or []}\n\n"
-        f"BLOCKER_DETAILS:\n{json.dumps(blocker_details, ensure_ascii=False, indent=2) if blocker_details else '[]'}\n\n"
-        f"VISIBLE_RESOLVE_TARGETS:\n{json.dumps(visible_resolve_targets, ensure_ascii=False, indent=2) if visible_resolve_targets else '[]'}\n\n"
-        f"RECOVERY_OPTIONS:\n{json.dumps(recovery_options, ensure_ascii=False, indent=2) if recovery_options else '[]'}\n\n"
-        f"RECENT_BLOCKER_ATTEMPTS:\n{json.dumps(recent_blocker_attempts, ensure_ascii=False, indent=2) if recent_blocker_attempts else '[]'}\n\n"
+        f"BLOCKER_DETAILS:\n{_json_compact(blocker_details) if blocker_details else '[]'}\n\n"
+        f"VISIBLE_RESOLVE_TARGETS:\n{_json_compact(visible_resolve_targets) if visible_resolve_targets else '[]'}\n\n"
+        f"RECOVERY_OPTIONS:\n{_json_compact(recovery_options) if recovery_options else '[]'}\n\n"
+        f"RECENT_BLOCKER_ATTEMPTS:\n{_json_compact(recent_blocker_attempts) if recent_blocker_attempts else '[]'}\n\n"
         f"LAST_UNRESOLVED_ACTION:\n{last_unresolved}\n\n"
         f"RECENT_HISTORY:\n{hist}\n\n"
         f"CURRENT_OCR:\n{ocr}\n\n"
@@ -368,13 +381,21 @@ async def call_planner_llm(req: PlannerRequest, system_prompt: str) -> str:
             },
         )
 
+    request_kwargs: Dict[str, Any] = {
+        "model": OLLAMA_MODEL,
+        "temperature": 0.2,
+    }
+    session_id = (req.planner_session_id or "").strip()
+    if PLANNER_LM_SESSION_ENABLED and session_id:
+        request_kwargs["extra_body"] = {"session_id": session_id}
+        request_kwargs["user"] = session_id
+
     if req.screenshot_b64 and str(req.screenshot_b64).strip():
         data_url = _data_url_from_b64(req.screenshot_b64, req.screenshot_mime)
         try:
-            logger.info("planner.llm_call %s", {"multimodal": True, "model": OLLAMA_MODEL})
+            logger.info("planner.llm_call %s", {"multimodal": True, "model": OLLAMA_MODEL, "session_id": session_id or None})
             resp = await client.chat.completions.create(
-                model=OLLAMA_MODEL,
-                temperature=0.2,
+                **request_kwargs,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {
@@ -395,10 +416,9 @@ async def call_planner_llm(req: PlannerRequest, system_prompt: str) -> str:
             # fall back to text-only below
             pass
 
-    logger.info("planner.llm_call %s", {"multimodal": False, "model": OLLAMA_MODEL})
+    logger.info("planner.llm_call %s", {"multimodal": False, "model": OLLAMA_MODEL, "session_id": session_id or None})
     resp = await client.chat.completions.create(
-        model=OLLAMA_MODEL,
-        temperature=0.2,
+        **request_kwargs,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},

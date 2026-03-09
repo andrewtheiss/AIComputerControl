@@ -74,6 +74,7 @@ def _find_targets(
                         "label": txt,
                         "box": [int(v) for v in item.get("box", [0, 0, 0, 0])],
                         "level": str(item.get("level", "word") or "word"),
+                        "area": max(1, int(item.get("box", [0, 0, 1, 1])[2]) - int(item.get("box", [0, 0, 1, 1])[0])) * max(1, int(item.get("box", [0, 0, 1, 1])[3]) - int(item.get("box", [0, 0, 1, 1])[1])),
                         "dual_purpose": bool(dual_purpose),
                     }
                 )
@@ -141,9 +142,8 @@ def classify_blockers(text_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 resolve_targets=_find_targets(
                     items,
                     [
-                        ("click_visible_resolve_target", [r"\bstart new session\b"], True),
-                        ("click_visible_resolve_target", [r"\brestore session\b"], True),
-                        ("click_visible_resolve_target", [r"\brestore previous session\b"], True),
+                        ("click_visible_resolve_target", [r"\bstart new session\b", r"\bstart new\b", r"\bnew session\b"], True),
+                        ("click_visible_resolve_target", [r"\brestore session\b", r"\brestore previous session\b"], True),
                         ("click_visible_resolve_target", [r"\bclose tab\b", r"\bclose\b"], False),
                     ],
                 ),

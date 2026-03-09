@@ -26,8 +26,14 @@ AGENT_GOAL       = os.environ.get("AGENT_GOAL", "").strip()
 TASK_PLANNER_URL = os.environ.get("TASK_PLANNER_URL", "http://localhost:8000/v1/actions/next")
 PLANNER_API_KEY  = os.environ.get("PLANNER_API_KEY", "")      # optional, see §3.4
 MAX_STEPS        = int(os.environ.get("MAX_STEPS", "80"))
-HISTORY_WINDOW   = int(os.environ.get("HISTORY_WINDOW", "10"))
+HISTORY_WINDOW   = int(os.environ.get("HISTORY_WINDOW", "6"))
 OCR_LIMIT        = int(os.environ.get("OCR_LIMIT", "400"))     # cap tokens
+PLANNER_SEND_SCREENSHOT_MODE = os.environ.get("PLANNER_SEND_SCREENSHOT_MODE", "").strip().lower() or ("always" if os.environ.get("PLANNER_SEND_SCREENSHOT", "1").strip() != "0" else "never")
+PLANNER_SCREENSHOT_JPEG_QUALITY = int(os.environ.get("PLANNER_SCREENSHOT_JPEG_QUALITY", "50"))
+PLANNER_SCREENSHOT_MAX_DIM = int(os.environ.get("PLANNER_SCREENSHOT_MAX_DIM", "1280"))
+PLANNER_MAX_OCR_LINE_ELEMENTS = max(0, min(200, int(os.environ.get("PLANNER_MAX_OCR_LINE_ELEMENTS", "40"))))
+PLANNER_MAX_OCR_WORD_ELEMENTS = max(0, min(300, int(os.environ.get("PLANNER_MAX_OCR_WORD_ELEMENTS", "80"))))
+PLANNER_MAX_AX_ELEMENTS = max(0, min(200, int(os.environ.get("PLANNER_MAX_AX_ELEMENTS", "40"))))
 
 DETECT_API_URL = os.environ.get("DETECT_API_URL") or os.environ.get("RTDETR_API_URL", "http://rtdetr-api:8000/predict")
 AGENT_NAME = os.environ.get("AGENT_NAME", "agent-1")
@@ -89,11 +95,63 @@ def redact_if_confidential(s: str, confidential: bool) -> str:
 class ScreenGrabber:
     """
     Wrap mss with cached monitor geometry so we can map image-space -> absolute desktop coords.
+
+    Scale factors (CLICK_SCALE_X / CLICK_SCALE_Y env vars, default 1.0):
+      On HiDPI displays mss captures at physical resolution while xdotool uses
+      logical coordinates.  Set e.g. CLICK_SCALE_X=0.5 CLICK_SCALE_Y=0.5 for 2×
+      HiDPI, or run with CLICK_SCALE_AUTO=1 to detect automatically via xrandr.
     """
     def __init__(self, screen_index: int = 1):
         self.screen_index = screen_index
         self.last_mon: Optional[Dict[str, int]] = None
         self._mss = mss.mss()
+        self.scale_x, self.scale_y = self._init_scale()
+
+    def _init_scale(self) -> Tuple[float, float]:
+        env_x = os.environ.get("CLICK_SCALE_X", "").strip()
+        env_y = os.environ.get("CLICK_SCALE_Y", "").strip()
+        auto  = os.environ.get("CLICK_SCALE_AUTO", "0").strip() not in ("0", "", "false", "no")
+        if env_x and env_y:
+            try:
+                sx, sy = float(env_x), float(env_y)
+                print(json.dumps({"ts": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                                   "level": "info", "msg": "screen.scale.env",
+                                   "scale_x": sx, "scale_y": sy}), flush=True)
+                return sx, sy
+            except ValueError:
+                pass
+        if auto:
+            detected = self._detect_scale_xrandr()
+            if detected:
+                sx, sy = detected
+                print(json.dumps({"ts": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                                   "level": "info", "msg": "screen.scale.auto",
+                                   "scale_x": sx, "scale_y": sy}), flush=True)
+                return sx, sy
+        return 1.0, 1.0
+
+    def _detect_scale_xrandr(self) -> Optional[Tuple[float, float]]:
+        """
+        Compare the mss monitor dimensions against xrandr's reported logical resolution.
+        Returns (scale_x, scale_y) or None if detection fails.
+        """
+        try:
+            import subprocess as _sp
+            out = _sp.check_output(["xrandr", "--current"], text=True, timeout=3)
+            # Match lines like "  1920x1080+0+0" (active mode line)
+            m = re.search(r'\bconnected\b.*?(\d{3,5})x(\d{3,5})\+\d+\+\d+', out)
+            if not m:
+                return None
+            logical_w, logical_h = int(m.group(1)), int(m.group(2))
+            mon = self._mss.monitors[self.screen_index]
+            if mon["width"] > 0 and mon["height"] > 0:
+                sx = logical_w / mon["width"]
+                sy = logical_h / mon["height"]
+                if abs(sx - 1.0) > 0.01 or abs(sy - 1.0) > 0.01:
+                    return sx, sy
+        except Exception:
+            pass
+        return None
 
     def capture(self) -> Tuple[np.ndarray, Dict[str, int]]:
         mon = self._mss.monitors[self.screen_index]
@@ -105,11 +163,15 @@ class ScreenGrabber:
 
     def to_abs(self, x_rel: int, y_rel: int) -> Tuple[int, int]:
         """
-        Convert image (monitor-relative) coords -> absolute desktop coords
+        Convert image (monitor-relative) coords -> absolute desktop coords,
+        applying any configured scale factors.
         """
         if not self.last_mon:
             raise RuntimeError("Screen geometry not captured yet.")
-        return int(self.last_mon["left"] + x_rel), int(self.last_mon["top"] + y_rel)
+        return (
+            int(self.last_mon["left"] + x_rel * self.scale_x),
+            int(self.last_mon["top"]  + y_rel * self.scale_y),
+        )
 
 # -----------------------
 # OCR (HTTP-first with fallback)
@@ -235,6 +297,16 @@ def encode_jpeg_bgr(image_bgr: np.ndarray, q: int = 85) -> bytes:
     if not ok:
         raise RuntimeError("cv2.imencode failed")
     return buf.tobytes()
+
+def encode_jpeg_bgr_resized(image_bgr: np.ndarray, q: int = 85, max_dim: int = 1280) -> bytes:
+    img = image_bgr
+    if max_dim and max_dim > 0:
+        h, w = img.shape[:2]
+        longest = max(h, w)
+        if longest > max_dim:
+            scale = float(max_dim) / float(longest)
+            img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    return encode_jpeg_bgr(img, q=q)
 
 def rtdetr_detect(session: requests.Session, image_bgr: np.ndarray, timeout=(3.0, 6.0), retries: int = 2) -> List[Dict[str, Any]]:
     jpg = encode_jpeg_bgr(image_bgr)
@@ -995,6 +1067,7 @@ class ActionExecutorDynamic:
         self.trace_html_path = os.path.join(self.run_dir, "trace.html")
         self._trace_tail: List[Dict[str, Any]] = []
         self._last_click_debug: Optional[Dict[str, Any]] = None
+        self.planner_session_id = f"{AGENT_NAME}:{hashlib.sha1((AGENT_GOAL or self.run_id).encode('utf-8')).hexdigest()[:12]}"
 
     # --- Logging, capture, OCR ---
     def _log(self, level: str, msg: str, extra: Optional[Dict[str, Any]] = None):
@@ -1065,6 +1138,66 @@ class ActionExecutorDynamic:
             self._log("warn", "click.debug.crop_failed", {"error": str(e), "action": action})
             return None
 
+    def _save_click_visual_debug(
+        self,
+        *,
+        ocr_box: List[int],
+        final_box: List[int],
+        click_rel: Tuple[int, int],
+        action: str,
+    ) -> Dict[str, str]:
+        """
+        Save two full-frame annotated images for each click action:
+
+        1. ``*_ocr_box.jpg``   – the raw OCR-matched bounding box highlighted in
+                                  cyan on the full screenshot.
+        2. ``*_click_target.jpg`` – the final click box (green) and click centre
+                                    (red crosshair) on the full screenshot.
+                                    If the box was refined away from the OCR match
+                                    the original OCR box is also drawn in cyan.
+
+        Returns {"ocr_box_path": ..., "click_target_path": ...} (empty dict on error).
+        """
+        if self.last_img is None or not (self.debug_enabled and self.trace_enabled):
+            return {}
+        try:
+            ts_ms = int(time.time() * 1000)
+            paths: Dict[str, str] = {}
+
+            ox1, oy1, ox2, oy2 = [int(v) for v in ocr_box]
+            fx1, fy1, fx2, fy2 = [int(v) for v in final_box]
+            cx, cy = int(click_rel[0]), int(click_rel[1])
+
+            # Image 1: OCR-identified box (cyan)
+            img1 = self.last_img.copy()
+            cv2.rectangle(img1, (ox1, oy1), (ox2, oy2), (0, 220, 255), 3)
+            cv2.putText(img1, "OCR match", (ox1, max(14, oy1 - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 220, 255), 2,
+                        cv2.LINE_AA)
+            p1 = os.path.join(self.run_dir, f"{ts_ms}_{action}_ocr_box.jpg")
+            cv2.imwrite(p1, img1, [int(cv2.IMWRITE_JPEG_QUALITY), 72])
+            paths["ocr_box_path"] = p1
+
+            # Image 2: final click target (green box) + click point (red crosshair)
+            img2 = self.last_img.copy()
+            if [ox1, oy1, ox2, oy2] != [fx1, fy1, fx2, fy2]:
+                # show original OCR box too so the refinement is visible
+                cv2.rectangle(img2, (ox1, oy1), (ox2, oy2), (0, 220, 255), 2)
+            cv2.rectangle(img2, (fx1, fy1), (fx2, fy2), (0, 210, 0), 3)
+            cv2.circle(img2, (cx, cy), 9, (0, 0, 255), -1)
+            cv2.drawMarker(img2, (cx, cy), (0, 0, 255),
+                           cv2.MARKER_CROSS, 28, 3, cv2.LINE_AA)
+            cv2.putText(img2, f"({cx},{cy})", (max(0, cx + 12), max(14, cy - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2, cv2.LINE_AA)
+            p2 = os.path.join(self.run_dir, f"{ts_ms}_{action}_click_target.jpg")
+            cv2.imwrite(p2, img2, [int(cv2.IMWRITE_JPEG_QUALITY), 72])
+            paths["click_target_path"] = p2
+
+            return paths
+        except Exception as e:
+            self._log("warn", "click.visual_debug.failed", {"error": str(e), "action": action})
+            return {}
+
     def _trace_append(self, rec: Dict[str, Any]) -> None:
         if not self.trace_enabled:
             return
@@ -1113,14 +1246,32 @@ class ActionExecutorDynamic:
                 frame = it.get("frame_path") or ""
                 post_frame = it.get("post_frame_path") or ""
                 crop = it.get("crop_overlay_path") or ""
+                ocr_box_ov = it.get("ocr_box_overlay_path") or ""
+                click_tgt_ov = it.get("click_target_overlay_path") or ""
                 imgs = []
-                if crop:
-                    imgs.append(f'<figure><img src="{os.path.basename(crop)}" alt="crop overlay"/><figcaption>target</figcaption></figure>')
+                # Full-frame click debug images (click_text / click_any_text / click_near_text)
+                if ocr_box_ov:
+                    imgs.append(
+                        f'<figure><img src="{os.path.basename(ocr_box_ov)}" alt="ocr box"/>'
+                        f'<figcaption>OCR match</figcaption></figure>'
+                    )
+                if click_tgt_ov:
+                    imgs.append(
+                        f'<figure><img src="{os.path.basename(click_tgt_ov)}" alt="click target"/>'
+                        f'<figcaption>click target</figcaption></figure>'
+                    )
+                # Legacy crop overlay (fall back if no full-frame overlays)
+                if crop and not (ocr_box_ov or click_tgt_ov):
+                    imgs.append(
+                        f'<figure><img src="{os.path.basename(crop)}" alt="crop overlay"/>'
+                        f'<figcaption>target (crop)</figcaption></figure>'
+                    )
                 if frame:
                     imgs.append(f'<figure><img src="{os.path.basename(frame)}" alt="frame"/><figcaption>before</figcaption></figure>')
                 if post_frame:
                     imgs.append(f'<figure><img src="{os.path.basename(post_frame)}" alt="post frame"/><figcaption>after</figcaption></figure>')
                 img_html = "".join(imgs) if imgs else '<div class="noimg">no image</div>'
+                n_imgs = len(imgs)
                 card_cls = "card"
                 if status == "success" and outcome_verified:
                     card_cls += " ok"
@@ -1128,6 +1279,9 @@ class ActionExecutorDynamic:
                     card_cls += " warn"
                 else:
                     card_cls += " bad"
+                ocr_box_val = result.get("ocr_box") or ""
+                click_abs_val = result.get("click_abs") or result.get("clicked_abs") or ""
+                img_cols = max(2, min(4, n_imgs))
                 cards.append(
                     f"""
 <div class="{card_cls}">
@@ -1135,7 +1289,7 @@ class ActionExecutorDynamic:
     <div class="idx">#{idx}</div>
     <div class="meta">{ts} · <b>{executed_action}</b> · {status}</div>
   </div>
-  <div class="imgs">{img_html}</div>
+  <div class="imgs" style="grid-template-columns:repeat({img_cols},1fr)">{img_html}</div>
   <div class="txt"><b>planner</b> {planner_action} {planner_params}</div>
   <div class="txt"><b>executed</b> {executed_action} {executed_params}</div>
   <div class="txt"><b>why</b> {why}</div>
@@ -1143,6 +1297,8 @@ class ActionExecutorDynamic:
   <div class="txt"><b>blocker</b> {blocker_class}</div>
   <div class="txt"><b>recovery</b> strategy={recovery_strategy} effect={recovery_effect}</div>
   <div class="txt"><b>targeting</b> {targeting_source}</div>
+  <div class="txt"><b>ocr box</b> {ocr_box_val}</div>
+  <div class="txt"><b>click abs</b> {click_abs_val}</div>
   <div class="txt"><b>override</b> {executor_override_reason}</div>
   <div class="txt"><b>evidence</b> {verification_evidence}</div>
   <div class="txt"><b>before tags</b> {before_state.get("tags", [])}</div>
@@ -1156,7 +1312,8 @@ class ActionExecutorDynamic:
 <title>Agent trace</title>
 <style>
 body {{ font-family: system-ui, Arial, sans-serif; margin: 16px; }}
-.grid {{ display:grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }}
+.grid {{ display:grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }}
+@media (min-width:1600px) {{ .grid {{ grid-template-columns: repeat(4, 1fr); }} }}
 .card {{ border:1px solid #ddd; border-radius:10px; padding:10px; background:#fff; }}
 .card.ok {{ border-color:#9ad0a0; background:#f5fff6; }}
 .card.warn {{ border-color:#e9c46a; background:#fffaf0; }}
@@ -1164,18 +1321,32 @@ body {{ font-family: system-ui, Arial, sans-serif; margin: 16px; }}
 .hdr {{ display:flex; justify-content:space-between; align-items:baseline; gap:8px; }}
 .idx {{ font-weight:700; }}
 .meta {{ font-size:12px; color:#333; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
-.imgs {{ display:grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 8px; }}
+.imgs {{ display:grid; grid-template-columns: repeat(2, 1fr); gap: 6px; margin-top: 8px; }}
 figure {{ margin:0; }}
-figcaption {{ font-size:11px; color:#666; margin-top:4px; text-align:center; }}
-img {{ width:100%; height:auto; border-radius:8px; background:#f6f6f6; }}
-.txt {{ font-size:12px; color:#222; margin-top:8px; word-break:break-word; }}
+figcaption {{ font-size:11px; color:#666; margin-top:3px; text-align:center; }}
+img {{ width:100%; height:auto; border-radius:6px; background:#f6f6f6; cursor:zoom-in; }}
+img:hover {{ outline:2px solid #4a90d9; }}
+.txt {{ font-size:12px; color:#222; margin-top:6px; word-break:break-word; }}
 .noimg {{ font-size:12px; color:#777; padding:18px; text-align:center; border:1px dashed #ccc; border-radius:8px; }}
+/* lightbox */
+#lb {{ display:none; position:fixed; inset:0; background:rgba(0,0,0,.82); z-index:9999; align-items:center; justify-content:center; cursor:zoom-out; }}
+#lb.open {{ display:flex; }}
+#lb img {{ max-width:95vw; max-height:95vh; border-radius:8px; box-shadow:0 4px 32px rgba(0,0,0,.6); }}
 </style></head>
 <body>
 <h2>Last {len(items)} actions (auto-updated)</h2>
+<div id="lb"><img id="lb-img" src="" alt=""/></div>
 <div class="grid">
 {''.join(cards)}
 </div>
+<script>
+var lb=document.getElementById('lb'),lbi=document.getElementById('lb-img');
+document.querySelectorAll('.imgs img').forEach(function(img){{
+  img.addEventListener('click',function(e){{e.stopPropagation();lbi.src=img.src;lb.classList.add('open');}});
+}});
+lb.addEventListener('click',function(){{lb.classList.remove('open');lbi.src='';}});
+document.addEventListener('keydown',function(e){{if(e.key==='Escape'){{lb.classList.remove('open');lbi.src='';}}}});
+</script>
 </body></html>"""
             with open(self.trace_html_path, "w", encoding="utf-8") as f:
                 f.write(html)
@@ -1325,6 +1496,144 @@ img {{ width:100%; height:auto; border-radius:8px; background:#f6f6f6; }}
             if bx1 <= cx <= bx2:
                 cx = min(w - 40, max(40, bx2 + 80))
         return [max(0, cx - 12), max(0, cy - 12), min(w, cx + 12), min(h, cy + 12)]
+
+    def _preferred_resolve_target(self, snapshot: Dict[str, Any], blocker: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if blocker is None:
+            return None
+        candidates: List[Dict[str, Any]] = []
+        for target in blocker.get("resolve_targets") or []:
+            box = target.get("box") if isinstance(target.get("box"), list) else None
+            scope = self._target_scope_from_box(box, snapshot, blocker)
+            area = int(target.get("area") or 0)
+            if box and scope == "page_content":
+                candidates.append(dict(target, scope=scope, area=area))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: (-int(bool(item.get("dual_purpose"))), -int(item.get("area", 0))))
+        return candidates[0]
+
+    def _crop_ocr_refine_target(
+        self,
+        target: Dict[str, Any],
+        *,
+        regex: Optional[str] = None,
+        any_regex: Optional[List[str]] = None,
+        fuzzy_text: Optional[str] = None,
+        fuzzy_threshold: Optional[float] = None,
+        prefer_bold: bool = False,
+        nth: int = 0,
+    ) -> Optional[Dict[str, Any]]:
+        if self.last_img is None:
+            return None
+        box = target.get("box")
+        if not isinstance(box, list) or len(box) != 4:
+            return None
+        x1, y1, x2, y2 = [int(v) for v in box]
+        w = max(1, x2 - x1)
+        h = max(1, y2 - y1)
+        pad = max(24, min(120, int(max(w, h) * 2.2)))
+        img_h, img_w = self.last_img.shape[:2]
+        left = max(0, x1 - pad)
+        top = max(0, y1 - pad)
+        right = min(img_w, x2 + pad)
+        bottom = min(img_h, y2 + pad)
+        if right - left < 8 or bottom - top < 8:
+            return None
+
+        crop = self.last_img[top:bottom, left:right].copy()
+        scale = 2 if max(w, h) <= 80 else 1
+        if scale > 1:
+            crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        crop_levels = ocr_image_levels(crop)
+        crop_words = list(crop_levels.get("words") or [])
+        crop_lines = list(crop_levels.get("lines") or [])
+        refined = find_text_box(
+            crop_words,
+            line_items=crop_lines,
+            regex=regex,
+            any_regex=any_regex,
+            fuzzy_text=fuzzy_text,
+            fuzzy_threshold=fuzzy_threshold,
+            prefer_bold=prefer_bold,
+            nth=nth,
+        )
+        if not refined:
+            return None
+
+        rx1, ry1, rx2, ry2 = [int(v) for v in refined.get("box", [0, 0, 0, 0])]
+        mapped_box = [
+            int(left + rx1 / scale),
+            int(top + ry1 / scale),
+            int(left + rx2 / scale),
+            int(top + ry2 / scale),
+        ]
+        return {
+            "text": refined.get("text", target.get("text", "")),
+            "box": mapped_box,
+            "level": f"{refined.get('level', 'word')}_crop",
+            "scope": target.get("scope", ""),
+        }
+
+    def _maybe_refine_click_target(
+        self,
+        action: str,
+        params: Dict[str, Any],
+        snapshot: Dict[str, Any],
+        blocker: Optional[Dict[str, Any]],
+        target: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        if not target or str(target.get("scope", "")) != "browser_chrome":
+            return target
+        box = target.get("box")
+        if not isinstance(box, list) or len(box) != 4:
+            return target
+        width = max(1, int(box[2]) - int(box[0]))
+        height = max(1, int(box[3]) - int(box[1]))
+        tiny_target = width <= 140 and height <= 36
+        if action not in ("click_text", "click_any_text", "click_near_text") or not tiny_target:
+            return target
+
+        regex = params.get("regex")
+        any_regex = params.get("patterns")
+        if action == "click_near_text":
+            regex = params.get("anchor_regex")
+            any_regex = None
+        refined = self._crop_ocr_refine_target(
+            target,
+            regex=regex,
+            any_regex=any_regex if isinstance(any_regex, list) else None,
+            fuzzy_text=params.get("fuzzy_text"),
+            fuzzy_threshold=params.get("fuzzy_threshold"),
+            prefer_bold=bool(params.get("prefer_bold", False)),
+            nth=int(params.get("nth", 0)),
+        )
+        return refined or target
+
+    def _should_send_planner_screenshot(self, snapshot: Dict[str, Any]) -> bool:
+        mode = (PLANNER_SEND_SCREENSHOT_MODE or "auto").lower()
+        if mode in ("0", "never", "false", "off"):
+            return False
+        if mode in ("1", "always", "true", "on"):
+            return True
+
+        blockers = self._active_blockers(snapshot)
+        if not (self.last_ocr_words or self.last_ocr_lines):
+            return True
+        if "state:unclassified" in set(snapshot.get("tags", [])):
+            return True
+        if blockers:
+            if any(not (blocker.get("resolve_targets") or []) for blocker in blockers):
+                return True
+            return False
+        unresolved_recent = [
+            item for item in self.history[-3:]
+            if (item.get("result") or {}).get("outcome_verified") is False or (item.get("result") or {}).get("status") == "dispatched"
+        ]
+        if len(unresolved_recent) >= 2:
+            return True
+        if len(self.last_ocr_words) < 6 and len(self.last_ocr_lines) < 3:
+            return True
+        return False
 
     def _match_resolve_target(self, blocker: Dict[str, Any], target: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         if not target:
@@ -1578,6 +1887,23 @@ img {{ width:100%; height:auto; border-radius:8px; background:#f6f6f6; }}
             if counts.get("refocus_urlbar", 0) < 1:
                 return override("key_seq", {"keys": ["Ctrl+l"]}, "browser_dropdown_refocus_urlbar", "refocus_urlbar")
             return block("browser_dropdown_requires_page_target_or_open_url_not_more_escape")
+
+        if blocker_class == "browser_session_restore":
+            preferred_target = self._preferred_resolve_target(snapshot, blocker)
+            if strategy == "click_visible_resolve_target":
+                matched = self._match_resolve_target(blocker or {}, target)
+                if matched is not None and str((target or {}).get("scope", "")) == "page_content":
+                    return allow("page_level_session_restore_resolve_target_selected")
+            if preferred_target and counts.get("click_visible_resolve_target", 0) < 2:
+                return override(
+                    "click_box",
+                    {"box": [int(v) for v in preferred_target.get("box", [0, 0, 0, 0])]},
+                    "prefer_large_session_restore_cta_over_chrome_target",
+                    "click_visible_resolve_target",
+                )
+            if strategy == "open_url":
+                return allow("open_url_bypasses_session_restore_page")
+            return block("session_restore_requires_large_page_resolve_target_or_open_url")
 
         if strategy == "click_visible_resolve_target":
             return allow("visible_blocker_resolve_target_selected")
@@ -2320,6 +2646,8 @@ img {{ width:100%; height:auto; border-radius:8px; background:#f6f6f6; }}
     def _action_click_any_text(self, patterns, nth: int = 0, prefer_bold: bool = True):
         # try each regex in order until one has a match
         import re
+        snapshot = self._state_snapshot()
+        blocker = self._primary_blocker(snapshot)
         for pat in patterns:
             w = find_text_box(
                 self.last_ocr_words or self.last_ocr,
@@ -2329,7 +2657,15 @@ img {{ width:100%; height:auto; border-radius:8px; background:#f6f6f6; }}
                 prefer_bold=prefer_bold
             )
             if w:
+                ocr_box = list(w["box"])
+                w = self._maybe_refine_click_target("click_any_text", {"patterns": patterns, "nth": nth, "prefer_bold": prefer_bold}, snapshot, blocker, w) or w
                 x1,y1,x2,y2 = w["box"]; cx,cy = (x1+x2)//2, (y1+y2)//2
+                vis_paths = self._save_click_visual_debug(
+                    ocr_box=ocr_box,
+                    final_box=[int(x1), int(y1), int(x2), int(y2)],
+                    click_rel=(int(cx), int(cy)),
+                    action="click_any_text",
+                )
                 self._debug_save_click_crop(
                     box=[int(x1), int(y1), int(x2), int(y2)],
                     click_rel=(int(cx), int(cy)),
@@ -2345,22 +2681,36 @@ img {{ width:100%; height:auto; border-radius:8px; background:#f6f6f6; }}
                     "status": "success",
                     "clicked": w["text"],
                     "box": w["box"],
+                    "ocr_box": ocr_box,
                     "pattern_used": pat,
                     "ocr_level": w.get("level", "word"),
                     "targeting_source": f"ocr_{w.get('level', 'word')}",
+                    "click_abs": [x_abs, y_abs],
+                    "ocr_box_overlay_path": vis_paths.get("ocr_box_path", ""),
+                    "click_target_overlay_path": vis_paths.get("click_target_path", ""),
                 }
         return {"status":"failure","error_code":"ELEMENT_NOT_FOUND","error_message": f"No pattern matched: {patterns}"}
 
     def _action_click_near_text(self, anchor_regex: str, dx: int = 0, dy: int = 0):
         import re
+        snapshot = self._state_snapshot()
+        blocker = self._primary_blocker(snapshot)
         w = find_text_box(self.last_ocr_words or self.last_ocr, line_items=self.last_ocr_lines, regex=anchor_regex)
         if not w:
             return {"status":"failure","error_code":"ANCHOR_NOT_FOUND","error_message": anchor_regex}
+        ocr_box = list(w["box"])
+        w = self._maybe_refine_click_target("click_near_text", {"anchor_regex": anchor_regex, "dx": dx, "dy": dy}, snapshot, blocker, w) or w
         x1,y1,x2,y2 = w["box"]; cx,cy = (x1+x2)//2, (y1+y2)//2
         # Guard against header/account anchors (e.g., email in header)
         if "@" in w.get("text", "") and cy < 80:
             return {"status":"failure","error_code":"ANCHOR_REJECTED_HEADER","error_message": w.get("text", "")}
         click_x, click_y = int(cx + dx), int(cy + dy)
+        vis_paths = self._save_click_visual_debug(
+            ocr_box=ocr_box,
+            final_box=[click_x - 12, click_y - 12, click_x + 12, click_y + 12],
+            click_rel=(click_x, click_y),
+            action="click_near_text",
+        )
         # For near-text clicks, define a small box around the click point for cropping.
         self._debug_save_click_crop(
             box=[click_x - 12, click_y - 12, click_x + 12, click_y + 12],
@@ -2377,9 +2727,13 @@ img {{ width:100%; height:auto; border-radius:8px; background:#f6f6f6; }}
             "status": "success",
             "anchor": w["text"],
             "anchor_box": w["box"],
+            "ocr_box": ocr_box,
             "offset": [dx, dy],
             "anchor_level": w.get("level", "word"),
             "targeting_source": f"ocr_{w.get('level', 'word')}",
+            "click_abs": [x_abs, y_abs],
+            "ocr_box_overlay_path": vis_paths.get("ocr_box_path", ""),
+            "click_target_overlay_path": vis_paths.get("click_target_path", ""),
         }
 
     def _action_click_box(self, box):
@@ -2416,12 +2770,29 @@ img {{ width:100%; height:auto; border-radius:8px; background:#f6f6f6; }}
     ):
         if not (self.last_ocr_words or self.last_ocr_lines or self.last_ocr):
             return {"status": "failure", "error_code": "NO_OCR", "error_message": "No OCR results yet"}
+        snapshot = self._state_snapshot()
+        blocker = self._primary_blocker(snapshot)
         w = find_text_box(self.last_ocr_words or self.last_ocr, line_items=self.last_ocr_lines, regex=regex, nth=nth, prefer_bold=prefer_bold,
                           fuzzy_text=fuzzy_text, fuzzy_threshold=fuzzy_threshold)
         if not w:
             return {"status": "failure", "error_code": "ELEMENT_NOT_FOUND",
                     "error_message": f"Regex '{regex}' not found"}
+        ocr_box = list(w["box"])   # capture raw OCR match before any refinement
+        w = self._maybe_refine_click_target(
+            "click_text",
+            {"regex": regex, "nth": nth, "prefer_bold": prefer_bold, "fuzzy_text": fuzzy_text, "fuzzy_threshold": fuzzy_threshold},
+            snapshot,
+            blocker,
+            w,
+        ) or w
         x1,y1,x2,y2 = w["box"]; cx,cy = (x1+x2)//2, (y1+y2)//2
+        # Full-frame annotated images: OCR box + final click target
+        vis_paths = self._save_click_visual_debug(
+            ocr_box=ocr_box,
+            final_box=[int(x1), int(y1), int(x2), int(y2)],
+            click_rel=(int(cx), int(cy)),
+            action="click_text",
+        )
         self._debug_save_click_crop(
             box=[int(x1), int(y1), int(x2), int(y2)],
             click_rel=(int(cx), int(cy)),
@@ -2438,8 +2809,12 @@ img {{ width:100%; height:auto; border-radius:8px; background:#f6f6f6; }}
             "status": "success",
             "clicked": w["text"],
             "box": w["box"],
+            "ocr_box": ocr_box,
             "ocr_level": w.get("level", "word"),
             "targeting_source": f"ocr_{w.get('level', 'word')}",
+            "click_abs": [x_abs, y_abs],
+            "ocr_box_overlay_path": vis_paths.get("ocr_box_path", ""),
+            "click_target_overlay_path": vis_paths.get("click_target_path", ""),
         }
 
     def _action_type_text(self, text: str, confidential: bool = False):
@@ -2611,21 +2986,16 @@ img {{ width:100%; height:auto; border-radius:8px; background:#f6f6f6; }}
             screenshot_mime = "image/jpeg"
             ui_elements: List[Dict[str, Any]] = []
             try:
-                if os.environ.get("PLANNER_SEND_SCREENSHOT", "1").strip() != "0" and self.last_img is not None:
-                    q = int(os.environ.get("PLANNER_SCREENSHOT_JPEG_QUALITY", "60"))
-                    q = max(25, min(90, q))
-                    jpg = encode_jpeg_bgr(self.last_img, q=q)
+                if self._should_send_planner_screenshot(pre_action_snapshot) and self.last_img is not None:
+                    q = max(25, min(90, int(PLANNER_SCREENSHOT_JPEG_QUALITY)))
+                    jpg = encode_jpeg_bgr_resized(self.last_img, q=q, max_dim=PLANNER_SCREENSHOT_MAX_DIM)
                     screenshot_b64 = base64.b64encode(jpg).decode("ascii")
             except Exception as e:
                 self._log("warn", "planner.screenshot.encode_failed", {"error": str(e)})
 
             try:
                 # OCR elements (boxes are image-relative)
-                max_ocr_line_elems = int(os.environ.get("PLANNER_MAX_OCR_LINE_ELEMENTS", "80"))
-                max_ocr_word_elems = int(os.environ.get("PLANNER_MAX_OCR_WORD_ELEMENTS", "140"))
-                max_ocr_line_elems = max(0, min(200, max_ocr_line_elems))
-                max_ocr_word_elems = max(0, min(300, max_ocr_word_elems))
-                for w in self.last_ocr_lines[:max_ocr_line_elems]:
+                for w in self.last_ocr_lines[:PLANNER_MAX_OCR_LINE_ELEMENTS]:
                     ocr_min.append({"text": w["text"], "box": w["box"], "conf": w["conf"], "level": "line"})
                     ui_elements.append({
                         "source": "ocr_line",
@@ -2634,7 +3004,7 @@ img {{ width:100%; height:auto; border-radius:8px; background:#f6f6f6; }}
                         "score": float(w.get("conf", 0.0)) / 100.0 if float(w.get("conf", 0.0)) > 1.0 else float(w.get("conf", 0.0)),
                         "role": None,
                     })
-                for w in self.last_ocr_words[:max_ocr_word_elems]:
+                for w in self.last_ocr_words[:PLANNER_MAX_OCR_WORD_ELEMENTS]:
                     ocr_min.append({"text": w["text"], "box": w["box"], "conf": w["conf"], "level": "word"})
                     ui_elements.append({
                         "source": "ocr_word",
@@ -2660,9 +3030,7 @@ img {{ width:100%; height:auto; border-radius:8px; background:#f6f6f6; }}
                         })
 
                 if self.last_ax_nodes:
-                    max_ax_elems = int(os.environ.get("PLANNER_MAX_AX_ELEMENTS", "80"))
-                    max_ax_elems = max(0, min(200, max_ax_elems))
-                    for node in self.last_ax_nodes[:max_ax_elems]:
+                    for node in self.last_ax_nodes[:PLANNER_MAX_AX_ELEMENTS]:
                         box = node.get("box", [0, 0, 0, 0])
                         if not isinstance(box, list) or len(box) != 4:
                             box = [0, 0, 0, 0]
@@ -2684,6 +3052,7 @@ img {{ width:100%; height:auto; border-radius:8px; background:#f6f6f6; }}
                 "ui_elements": ui_elements,
                 "screenshot_b64": screenshot_b64,
                 "screenshot_mime": screenshot_mime,
+                "planner_session_id": self.planner_session_id,
                 "available_actions": [
                     "open_url","wait_text","wait_any_text",
                     "click_text","click_any_text","click_near_text","click_box",
@@ -2802,6 +3171,8 @@ img {{ width:100%; height:auto; border-radius:8px; background:#f6f6f6; }}
                                     "frame_path": frame_path,
                                     "post_frame_path": post_frame_path,
                                     "crop_overlay_path": crop_overlay,
+                                    "ocr_box_overlay_path": result.get("ocr_box_overlay_path") or "",
+                                    "click_target_overlay_path": result.get("click_target_overlay_path") or "",
                                     "ocr_results_n": len(ocr_min),
                                     "ocr_line_results_n": len(self.last_ocr_lines),
                                     "ocr_word_results_n": len(self.last_ocr_words),
@@ -2875,6 +3246,8 @@ img {{ width:100%; height:auto; border-radius:8px; background:#f6f6f6; }}
                     "frame_path": frame_path,
                     "post_frame_path": post_frame_path,
                     "crop_overlay_path": crop_overlay,
+                    "ocr_box_overlay_path": result.get("ocr_box_overlay_path") or "",
+                    "click_target_overlay_path": result.get("click_target_overlay_path") or "",
                     "ocr_results_n": len(ocr_min),
                     "ocr_line_results_n": len(self.last_ocr_lines),
                     "ocr_word_results_n": len(self.last_ocr_words),
