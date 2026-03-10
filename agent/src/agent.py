@@ -179,16 +179,187 @@ class ScreenGrabber:
 OCR_API_URL = os.environ.get("OCR_API_URL", "http://ocr-api:8020/ocr").strip()
 _ocr_client = OCRClient(url=OCR_API_URL, min_score=float(os.environ.get("OCR_MIN_SCORE", "0.45")))
 
+# Multi-pass OCR on "interaction bands" (top chrome + bottom footer) for better quality
+# on small UI text without running full-frame OCR at higher resolution.
+# Band sizes: top = top 18% of image, bottom = bottom 40%.
+OCR_BAND_MULTIPASS = os.environ.get("OCR_BAND_MULTIPASS", "1").strip() == "1"
+OCR_BAND_TOP_FRAC   = float(os.environ.get("OCR_BAND_TOP_FRAC",    "0.18"))
+OCR_BAND_BOTTOM_FRAC = float(os.environ.get("OCR_BAND_BOTTOM_FRAC", "0.40"))
+
+
+def _ocr_bands_merge(image_bgr: np.ndarray) -> Dict[str, Any]:
+    """
+    OCR tweak: run OCR on the full image plus the top-chrome and bottom-footer bands
+    separately, then merge results (deduplicating by box IOU > 0.5).
+
+    This improves detection of small UI text (address bar, dialog buttons) without
+    increasing global DET side length.  Only runs if OCR_BAND_MULTIPASS=1.
+    """
+    full = _ocr_client.ocr_levels(image_bgr)
+    if not OCR_BAND_MULTIPASS:
+        return full
+
+    h, w = image_bgr.shape[:2]
+    top_h    = max(1, int(h * OCR_BAND_TOP_FRAC))
+    bot_y    = max(0, h - int(h * OCR_BAND_BOTTOM_FRAC))
+
+    extra_words: List[Dict[str, Any]] = []
+    extra_lines: List[Dict[str, Any]] = []
+
+    def _merge_into(src_items: List[Dict[str, Any]], extra_list: List[Dict[str, Any]],
+                    existing: List[Dict[str, Any]], y_offset: int) -> None:
+        for item in src_items:
+            b = item.get("box")
+            if not isinstance(b, list) or len(b) != 4:
+                continue
+            # Shift box back to full-image coordinates
+            adjusted = dict(item, box=[b[0], b[1] + y_offset, b[2], b[3] + y_offset])
+            # Skip if highly overlapping with an existing result
+            duplicate = False
+            for ex in existing:
+                ex_b = ex.get("box")
+                if not isinstance(ex_b, list) or len(ex_b) != 4:
+                    continue
+                ax1, ay1, ax2, ay2 = [int(v) for v in adjusted["box"]]
+                bx1, by1, bx2, by2 = [int(v) for v in ex_b]
+                ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+                ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+                iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+                inter = iw * ih
+                if inter > 0:
+                    area_a = max(1, (ax2-ax1)*(ay2-ay1))
+                    iou = inter / area_a
+                    if iou > 0.5:
+                        duplicate = True
+                        break
+            if not duplicate:
+                extra_list.append(adjusted)
+
+    # Top band
+    if top_h > 10:
+        top_crop = image_bgr[:top_h, :, :]
+        try:
+            top_ocr = _ocr_client.ocr_levels(top_crop)
+            _merge_into(top_ocr.get("words", []), extra_words, full.get("words", []), 0)
+            _merge_into(top_ocr.get("lines", []), extra_lines, full.get("lines", []), 0)
+        except Exception:
+            pass
+
+    # Bottom band
+    if bot_y < h - 10:
+        bot_crop = image_bgr[bot_y:, :, :]
+        try:
+            bot_ocr = _ocr_client.ocr_levels(bot_crop)
+            _merge_into(bot_ocr.get("words", []), extra_words, full.get("words", []) + extra_words, bot_y)
+            _merge_into(bot_ocr.get("lines", []), extra_lines, full.get("lines", []) + extra_lines, bot_y)
+        except Exception:
+            pass
+
+    merged_words = full.get("words", []) + extra_words
+    merged_lines = full.get("lines", []) + extra_lines
+    return {"words": merged_words, "lines": merged_lines, "source": full.get("source", "http")}
+
+
 def ocr_image(image_bgr: np.ndarray) -> List[Dict[str, Any]]:
     """Return OCR words with boxes using OCRClient (HTTP preferred, Tesseract fallback)."""
     return _ocr_client.ocr(image_bgr)
 
 def ocr_image_levels(image_bgr: np.ndarray) -> Dict[str, Any]:
-    """Return OCR word + line boxes using OCRClient (HTTP preferred, Tesseract fallback)."""
-    return _ocr_client.ocr_levels(image_bgr)
+    """Return OCR word + line boxes (with multi-pass band merging if enabled)."""
+    return _ocr_bands_merge(image_bgr)
 
 def _score_boldish_height(box: List[int]) -> int:
     return box[3] - box[1]
+
+
+# Fix L — provenance origins (ordered from most to least trustworthy)
+# raw_word   : native OCR word-level box
+# line_item  : native OCR line-level box (whole-line match)
+# line_subbox: sub-box derived from line via character-proportional span (Fix F)
+# synth_word : synthetic token box from proportional line-split (Fix G)
+# a11y       : Accessibility-tree node coordinate
+# vlm        : VLM-derived coordinate
+BOX_ORIGINS_SYNTHETIC = frozenset({"synth_word", "line_subbox"})
+BOX_ORIGINS_TRUSTED   = frozenset({"raw_word", "line_item", "a11y", "vlm"})
+
+
+def _subbox_for_match(text: str, box: List[int], match_span: Tuple[int, int], pad: int = 8) -> List[int]:
+    """
+    Fix F: Given a full-line OCR box and the (start, end) character span of the
+    matched substring, return a tighter x-range for just that portion of the text.
+
+    Uses proportional character-width estimation.  The y-range is kept as-is.
+    Padding of `pad` px is added on both sides and then clamped to the line box.
+    """
+    x1, y1, x2, y2 = [int(v) for v in box]
+    line_w = max(1, x2 - x1)
+    n = max(1, len(text))
+    start, end = match_span
+    start = max(0, min(start, n))
+    end   = max(start, min(end, n))
+    # proportional x-slice
+    sx1 = x1 + int(line_w * start / n) - pad
+    sx2 = x1 + int(line_w * end   / n) + pad
+    # clamp to parent box
+    sx1 = max(x1, sx1)
+    sx2 = min(x2, max(sx1 + 8, sx2))
+    return [sx1, y1, sx2, y2]
+
+
+def _synthesize_word_boxes(line_item: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Fix G: Synthesize per-token boxes from a line OCR item whose text spans the
+    whole line box.  Tokens are split on whitespace; widths are allocated
+    proportional to character length (spaces count as 0.6 chars each).
+
+    Returns a list of word-level dicts with the same keys as normal OCR words.
+    Returns an empty list if the item already looks word-level or has no text.
+    """
+    text = str(line_item.get("text", "") or "").strip()
+    if not text:
+        return []
+    box = line_item.get("box", [])
+    if not isinstance(box, list) or len(box) != 4:
+        return []
+
+    # Skip if it's already a word-level item (rough heuristic: no space in text)
+    level = str(line_item.get("level", "line") or "line")
+    tokens = text.split(" ")
+    if len(tokens) <= 1 and level != "line":
+        return []
+
+    x1, y1, x2, y2 = [int(v) for v in box]
+    line_w = max(1, x2 - x1)
+    conf = int(line_item.get("conf", 50) or 50)
+
+    # Compute unit widths: each character = 1 unit, each space gap = 0.6
+    token_units = [max(1, len(t)) for t in tokens]
+    gap_units = [0.6] * max(0, len(tokens) - 1)
+    total_units = sum(token_units) + sum(gap_units)
+    if total_units <= 0:
+        return []
+
+    words = []
+    cursor = 0.0
+    for i, (tok, units) in enumerate(zip(tokens, token_units)):
+        if not tok:
+            cursor += units + (gap_units[i] if i < len(gap_units) else 0)
+            continue
+        wx1 = x1 + int(line_w * cursor / total_units)
+        wx2 = x1 + int(line_w * (cursor + units) / total_units)
+        wx2 = max(wx1 + 4, wx2)
+        wx2 = min(x2, wx2)
+        words.append({
+            "text": tok,
+            "box": [wx1, y1, wx2, y2],
+            "conf": conf,
+            "level": "word_synth",
+            "_origin": "synth_word",          # Fix L: provenance
+            "_parent_box": [x1, y1, x2, y2],  # Fix L: parent line box for refinement
+        })
+        cursor += units + (gap_units[i] if i < len(gap_units) else 0)
+    return words
+
 
 def _text_target_prefers_lines(*targets: Optional[Union[str, List[str]]]) -> bool:
     for target in targets:
@@ -213,6 +384,7 @@ def _find_text_box_in_items(
     fuzzy_threshold: Optional[float] = None,
     prefer_bold: bool = False,
     nth: int = 0,
+    apply_subbox: bool = True,
 ) -> Optional[Dict[str, Any]]:
     patterns = []
     if regex:
@@ -224,20 +396,56 @@ def _find_text_box_in_items(
     for item in items or []:
         s = str(item.get("text", "") or "")
         match_score = None
+        matched_span: Optional[Tuple[int, int]] = None
 
         if patterns:
-            if any(p.search(s) for p in patterns):
-                match_score = 100.0
+            for p in patterns:
+                m = p.search(s)
+                if m:
+                    match_score = 100.0
+                    matched_span = (m.start(), m.end())
+                    break
         elif fuzzy_text:
             score = fuzz.partial_ratio(fuzzy_text, s)
             if fuzzy_threshold is None or score >= float(fuzzy_threshold):
                 match_score = float(score)
+                # Approximate span for fuzzy: use full string
+                matched_span = (0, len(s))
 
         if match_score is None:
             continue
 
         matched = dict(item)
         matched.setdefault("level", default_level)
+
+        # Fix F: if the match is a substring of a line-level item, tighten the box.
+        box = matched.get("box")
+        level = str(matched.get("level", default_level) or "")
+        if (
+            apply_subbox
+            and matched_span is not None
+            and isinstance(box, list) and len(box) == 4
+            and level in ("line", "line_synth", "line_ocr")
+            and matched_span != (0, len(s))          # skip if whole-string match
+            and len(s) > 0
+        ):
+            sub = _subbox_for_match(s, box, matched_span, pad=8)
+            matched = dict(matched, box=sub, _subbox_applied=True, _original_box=box)
+            # Fix L: provenance — this is a derived sub-box, not a raw OCR box
+            matched["_origin"] = "line_subbox"
+            matched["_parent_box"] = list(box)
+        else:
+            # Fix L: stamp origin based on level
+            existing_origin = matched.get("_origin", "")
+            if not existing_origin:
+                lvl = str(matched.get("level", default_level) or "")
+                if lvl == "word_synth":
+                    matched["_origin"] = "synth_word"
+                elif lvl in ("line", "line_synth", "line_ocr"):
+                    matched["_origin"] = "line_item"
+                else:
+                    matched["_origin"] = "raw_word"
+
         bonus = _score_boldish_height(matched["box"]) if prefer_bold else 0
         candidates.append((match_score + bonus, matched))
 
@@ -260,21 +468,37 @@ def find_text_box(
 ) -> Optional[Dict[str, Any]]:
     """
     Find a text box by regex or fuzzy text.
-    - For multi-word targets, line OCR is preferred and word OCR is used as fallback.
-    - For single-word targets, word OCR is preferred and line OCR is used as fallback.
-    - regex / any_regex: case-insensitive compiled patterns
-    - fuzzy_text + fuzzy_threshold (0..100): RapidFuzz partial_ratio scoring
+
+    Search order:
+    - Multi-word / multi-token targets: line OCR first (with Fix F subbox refinement),
+      then synthesized word boxes from lines (Fix G), then raw word OCR.
+    - Single-word targets: word OCR first, then line OCR (with Fix F).
+
+    Fixes applied:
+    - Fix F: when a regex matches a substring of a line box, the returned box is
+      tightened to the matched character span (proportional width estimate).
+    - Fix G: line items are expanded into per-token boxes so that single-word
+      searches against line OCR return tight token-level boxes.
     """
     prefer_lines = _text_target_prefers_lines(regex, any_regex or [], fuzzy_text)
-    search_groups: List[Tuple[str, List[Dict[str, Any]]]] = []
-    if prefer_lines and line_items:
-        search_groups.append(("line", line_items))
-    if ocr_items:
-        search_groups.append(("word", ocr_items))
-    if not prefer_lines and line_items:
-        search_groups.append(("line", line_items))
 
-    for level, items in search_groups:
+    # Fix G: synthesise word-level boxes from each line item (cheap, proportional split)
+    synth_words: List[Dict[str, Any]] = []
+    for li in (line_items or []):
+        synth_words.extend(_synthesize_word_boxes(li))
+
+    search_groups: List[Tuple[str, List[Dict[str, Any]], bool]] = []
+    # (level_label, item_list, apply_subbox)
+    if prefer_lines and line_items:
+        search_groups.append(("line", line_items, True))         # Fix F active
+    if synth_words:
+        search_groups.append(("word_synth", synth_words, False)) # already word-level
+    if ocr_items:
+        search_groups.append(("word", ocr_items, False))         # native word boxes
+    if not prefer_lines and line_items:
+        search_groups.append(("line", line_items, True))         # Fix F active
+
+    for level, items, do_subbox in search_groups:
         match = _find_text_box_in_items(
             items,
             default_level=level,
@@ -284,6 +508,7 @@ def find_text_box(
             fuzzy_threshold=fuzzy_threshold,
             prefer_bold=prefer_bold,
             nth=nth,
+            apply_subbox=do_subbox,
         )
         if match:
             return match
@@ -1068,6 +1293,13 @@ class ActionExecutorDynamic:
         self._trace_tail: List[Dict[str, Any]] = []
         self._last_click_debug: Optional[Dict[str, Any]] = None
         self.planner_session_id = f"{AGENT_NAME}:{hashlib.sha1((AGENT_GOAL or self.run_id).encode('utf-8')).hexdigest()[:12]}"
+        # Hard cap: tracks how many transparent keyboard escalations the anti-repeat guard
+        # has fired per blocker signature. Resets naturally when the blocker signature changes.
+        self._guard_kb_escalations: Dict[str, int] = {}
+        # Max number of silent keyboard escalations we allow before surfacing to the planner.
+        self._GUARD_KB_ESCALATION_CAP = 2
+        # Last scored resolve candidates (set by _preferred_resolve_target) for trace visualization.
+        self._last_resolve_candidates: List[Dict[str, Any]] = []
 
     # --- Logging, capture, OCR ---
     def _log(self, level: str, msg: str, extra: Optional[Dict[str, Any]] = None):
@@ -1138,6 +1370,182 @@ class ActionExecutorDynamic:
             self._log("warn", "click.debug.crop_failed", {"error": str(e), "action": action})
             return None
 
+    def _vlm_locate_box(self, label: str, context: str = "") -> Optional[List[int]]:
+        """
+        Fix J: Ask the VLM (run_llm_vision) to locate a UI element by label in the
+        current screenshot.  Returns [x1, y1, x2, y2] in image-space, or None.
+
+        Only called when geometry is ambiguous (wide box, low confidence, or
+        repeated blocker failures).  Results are cached per (state_hash, label)
+        to avoid redundant calls.
+        """
+        if not LLM_API_URL or self.last_img is None:
+            return None
+        try:
+            h, w = self.last_img.shape[:2]
+            ctx_hint = f" Context: {context}." if context else ""
+            system = (
+                "You are a precise UI element locator. "
+                "Respond ONLY with a JSON object: {\"box\": [x1, y1, x2, y2]}. "
+                "Coordinates are in pixels (origin top-left). "
+                "Do not include any other text."
+            )
+            prompt = (
+                f"Image size: {w}x{h} px.{ctx_hint} "
+                f"Find the bounding box of the clickable UI element labeled: \"{label}\". "
+                "Return the tightest box around just that element, not the whole dialog."
+            )
+            resp = run_llm_vision(self.last_img, system, prompt)
+            # Extract JSON from response (may have surrounding prose)
+            m = re.search(r'\{[^}]*"box"\s*:\s*\[([^\]]+)\][^}]*\}', resp, re.I | re.S)
+            if not m:
+                # try bare array
+                m = re.search(r'\[(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*\d+\s*)\]', resp)
+            if m:
+                nums = [int(x.strip()) for x in m.group(1).split(",")]
+                if len(nums) == 4:
+                    x1, y1, x2, y2 = nums
+                    # Clamp to image bounds
+                    x1 = max(0, min(x1, w - 1))
+                    y1 = max(0, min(y1, h - 1))
+                    x2 = max(x1 + 4, min(x2, w))
+                    y2 = max(y1 + 4, min(y2, h))
+                    self._log("info", "vlm.locate_box", {
+                        "label": label, "box": [x1, y1, x2, y2],
+                        "raw_resp": resp[:200],
+                    })
+                    return [x1, y1, x2, y2]
+            self._log("warn", "vlm.locate_box.parse_failed", {
+                "label": label, "raw_resp": resp[:200]
+            })
+        except Exception as e:
+            self._log("warn", "vlm.locate_box.failed", {"label": label, "error": str(e)})
+        return None
+
+    def _box_is_ambiguous(self, box: Optional[List[int]], text: str = "") -> bool:
+        """
+        Return True when a box is geometrically ambiguous (too wide for its text
+        length, or extreme aspect ratio) and the VLM should be consulted as fallback.
+        """
+        if not isinstance(box, list) or len(box) != 4:
+            return True
+        bw = max(1, int(box[2]) - int(box[0]))
+        bh = max(1, int(box[3]) - int(box[1]))
+        n_chars = max(1, len(str(text or "").strip()))
+        w_per_char = bw / n_chars
+        aspect = bw / max(1, bh)
+        return w_per_char > 18 or aspect > 20
+
+    @staticmethod
+    def _draw_labeled_box(
+        img: np.ndarray,
+        box: List[int],
+        color: Tuple[int, int, int],
+        thickness: int,
+        label: str,
+        font_scale: float = 0.48,
+        font_thickness: int = 1,
+    ) -> None:
+        """Draw a rectangle with a label above it, clamped to image bounds."""
+        h, w = img.shape[:2]
+        x1, y1, x2, y2 = [int(v) for v in box]
+        x1c, y1c = max(0, x1), max(0, y1)
+        x2c, y2c = min(w - 1, x2), min(h - 1, y2)
+        if x2c <= x1c or y2c <= y1c:
+            return
+        cv2.rectangle(img, (x1c, y1c), (x2c, y2c), color, thickness)
+        if label:
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness)
+            tx = max(0, x1c)
+            ty = max(th + 2, y1c - 4)
+            # Dark backing for readability
+            cv2.rectangle(img, (tx - 1, ty - th - 2), (tx + tw + 2, ty + 2),
+                          (0, 0, 0), -1)
+            cv2.putText(img, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX,
+                        font_scale, color, font_thickness, cv2.LINE_AA)
+
+    @staticmethod
+    def _draw_crosshair(img: np.ndarray, cx: int, cy: int) -> None:
+        cv2.circle(img, (cx, cy), 9, (0, 0, 255), -1)
+        cv2.drawMarker(img, (cx, cy), (255, 255, 255), cv2.MARKER_CROSS, 32, 2, cv2.LINE_AA)
+        cv2.drawMarker(img, (cx, cy), (0, 0, 255), cv2.MARKER_CROSS, 28, 1, cv2.LINE_AA)
+
+    @staticmethod
+    def _legend_block(
+        img: np.ndarray,
+        entries: List[Tuple[Tuple[int,int,int], str]],
+    ) -> None:
+        """Draw a color-coded legend in the top-right corner."""
+        h, w = img.shape[:2]
+        row_h, pad, swatch = 18, 6, 14
+        lw = max(160, max(len(lbl) for _, lbl in entries) * 7 + swatch + pad * 2 + 6)
+        lh = row_h * len(entries) + pad * 2
+        ox = w - lw - 4
+        oy = 4
+        # Semi-transparent black background
+        sub = img[oy : oy + lh, ox : ox + lw]
+        black = np.zeros_like(sub)
+        cv2.addWeighted(sub, 0.35, black, 0.65, 0, sub)
+        img[oy : oy + lh, ox : ox + lw] = sub
+        for i, (color, lbl) in enumerate(entries):
+            ry = oy + pad + i * row_h
+            rx = ox + pad
+            cv2.rectangle(img, (rx, ry), (rx + swatch, ry + swatch - 2), color, -1)
+            cv2.putText(img, lbl, (rx + swatch + 4, ry + swatch - 3),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1, cv2.LINE_AA)
+
+    @staticmethod
+    def _crop_level(
+        img: np.ndarray,
+        box: List[int],
+        label: str,
+        box_color: Tuple[int,int,int],
+        click_pt: Optional[Tuple[int,int]] = None,
+        pad_factor: float = 0.4,
+        scale_up: int = 2,
+    ) -> np.ndarray:
+        """
+        Return a cropped view around `box` with the box drawn and optional click point.
+        Adds a header bar with `label`.
+        """
+        h, w = img.shape[:2]
+        x1, y1, x2, y2 = [int(v) for v in box]
+        bw, bh = max(1, x2 - x1), max(1, y2 - y1)
+        pad_x = max(20, int(bw * pad_factor))
+        pad_y = max(20, int(bh * pad_factor))
+        left   = max(0, x1 - pad_x)
+        top    = max(0, y1 - pad_y)
+        right  = min(w, x2 + pad_x)
+        bottom = min(h, y2 + pad_y)
+        crop = img[top:bottom, left:right].copy()
+        # Scale up small crops for readability
+        ch, cw = crop.shape[:2]
+        if scale_up > 1 and max(cw, ch) < 400:
+            crop = cv2.resize(crop, None, fx=scale_up, fy=scale_up,
+                              interpolation=cv2.INTER_CUBIC)
+        s = scale_up if (max(cw, ch) < 400) else 1
+        # Draw box in crop-local coords
+        lx1 = max(0, (x1 - left) * s)
+        ly1 = max(0, (y1 - top) * s)
+        lx2 = min(crop.shape[1] - 1, (x2 - left) * s)
+        ly2 = min(crop.shape[0] - 1, (y2 - top) * s)
+        cv2.rectangle(crop, (lx1, ly1), (lx2, ly2), box_color, max(1, s + 1))
+        if click_pt:
+            lcx = (click_pt[0] - left) * s
+            lcy = (click_pt[1] - top) * s
+            if 0 <= lcx < crop.shape[1] and 0 <= lcy < crop.shape[0]:
+                cv2.circle(crop, (lcx, lcy), max(4, s * 4), (0, 0, 255), -1)
+                cv2.drawMarker(crop, (lcx, lcy), (0, 0, 255), cv2.MARKER_CROSS,
+                               max(12, s * 12), max(1, s), cv2.LINE_AA)
+        # Header bar
+        bar_h = 20
+        bar = np.zeros((bar_h, crop.shape[1], 3), dtype=np.uint8)
+        bar[:] = (40, 40, 40)
+        box_coords = f"[{x1},{y1},{x2},{y2}]"
+        cv2.putText(bar, f"{label}  {box_coords}", (4, 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, box_color, 1, cv2.LINE_AA)
+        return np.vstack([bar, crop])
+
     def _save_click_visual_debug(
         self,
         *,
@@ -1145,54 +1553,182 @@ class ActionExecutorDynamic:
         final_box: List[int],
         click_rel: Tuple[int, int],
         action: str,
+        subbox_applied: bool = False,
+        parent_box: Optional[List[int]] = None,
+        origin: str = "",
+        candidates_debug: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, str]:
         """
-        Save two full-frame annotated images for each click action:
+        Save annotated full-frame images for each click action.
 
-        1. ``*_ocr_box.jpg``   – the raw OCR-matched bounding box highlighted in
-                                  cyan on the full screenshot.
-        2. ``*_click_target.jpg`` – the final click box (green) and click centre
-                                    (red crosshair) on the full screenshot.
-                                    If the box was refined away from the OCR match
-                                    the original OCR box is also drawn in cyan.
+        Images produced:
+        1. ``*_hierarchy.jpg``    – comprehensive single screenshot with ALL box levels
+                                    drawn (screen border → parent → OCR match → final target)
+                                    plus click point and legend. This is the primary debug view.
+        2. ``*_ocr_box.jpg``      – raw OCR-matched box (cyan) + all scored candidates.
+        3. ``*_click_target.jpg`` – final click box (green/magenta) + click crosshair.
+        4. ``*_level_N.jpg``      – one zoomed crop per box level in the hierarchy.
 
-        Returns {"ocr_box_path": ..., "click_target_path": ...} (empty dict on error).
+        Returns dict with all path keys (empty dict on error).
         """
         if self.last_img is None or not (self.debug_enabled and self.trace_enabled):
             return {}
         try:
             ts_ms = int(time.time() * 1000)
             paths: Dict[str, str] = {}
+            img_h, img_w = self.last_img.shape[:2]
+            cx, cy = int(click_rel[0]), int(click_rel[1])
 
             ox1, oy1, ox2, oy2 = [int(v) for v in ocr_box]
             fx1, fy1, fx2, fy2 = [int(v) for v in final_box]
-            cx, cy = int(click_rel[0]), int(click_rel[1])
 
-            # Image 1: OCR-identified box (cyan)
+            # ── Build the box hierarchy (from widest to narrowest) ───────────
+            # Each entry: (box, color_BGR, label, thickness)
+            is_vlm = action.endswith("_vlm")
+            final_color = (255, 0, 255) if is_vlm else (0, 230, 60)
+
+            # Determine distinct hierarchy levels
+            hierarchy: List[Tuple[List[int], Tuple[int,int,int], str, int]] = []
+
+            # Level 0: full screen boundary
+            screen_box = [0, 0, img_w - 1, img_h - 1]
+            hierarchy.append((screen_box, (180, 180, 180), "screen", 1))
+
+            # Level 1: parent line box (if present and different from ocr_box)
+            if (parent_box and isinstance(parent_box, list) and len(parent_box) == 4
+                    and parent_box != ocr_box):
+                hierarchy.append(([int(v) for v in parent_box], (0, 140, 255),
+                                   "parent line", 2))
+
+            # Level 2: OCR matched box (if different from final)
+            if [ox1, oy1, ox2, oy2] != [fx1, fy1, fx2, fy2]:
+                ocr_lbl = "OCR subbox" if subbox_applied else "OCR match"
+                hierarchy.append(([ox1, oy1, ox2, oy2], (0, 220, 255), ocr_lbl, 2))
+
+            # Level 3: final click target
+            final_lbl = f"VLM({origin})" if is_vlm else ("subbox" if subbox_applied else f"target({origin})")
+            hierarchy.append(([fx1, fy1, fx2, fy2], final_color, final_lbl, 3))
+
+            # ── Image 1: comprehensive hierarchy view ─────────────────────────
+            hier_img = self.last_img.copy()
+
+            # Background candidates in dark yellow (thinnest, drawn first)
+            for ci, cand in enumerate(candidates_debug or []):
+                cb = cand.get("box")
+                if isinstance(cb, list) and len(cb) == 4:
+                    cbx1, cby1, cbx2, cby2 = [int(v) for v in cb]
+                    cv2.rectangle(hier_img, (cbx1, cby1), (cbx2, cby2), (0, 170, 220), 1)
+                    stxt = (f"c{ci+1}:{cand['_score']:.0f}" if isinstance(cand.get("_score"), float)
+                            else f"c{ci+1}")
+                    cv2.putText(hier_img, stxt, (cbx1, max(9, cby1 - 2)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.30, (0, 170, 220), 1, cv2.LINE_AA)
+
+            # Draw hierarchy from widest → narrowest (so small boxes render on top)
+            for (hbox, hcol, hlbl, hthick) in hierarchy:
+                self._draw_labeled_box(hier_img, hbox, hcol, hthick, hlbl,
+                                       font_scale=0.45 if hthick <= 1 else 0.50)
+
+            # Click crosshair on top
+            self._draw_crosshair(hier_img, cx, cy)
+            cv2.putText(hier_img, f"click({cx},{cy})",
+                        (max(0, cx + 12), max(14, cy - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2, cv2.LINE_AA)
+
+            # Legend
+            legend_entries: List[Tuple[Tuple[int,int,int], str]] = [
+                ((180, 180, 180), "screen boundary"),
+            ]
+            if len(hierarchy) > 2:
+                legend_entries.append(((0, 140, 255), "parent line box"))
+            legend_entries.append(((0, 220, 255), "OCR match box"))
+            legend_entries.append((final_color, "final target"))
+            legend_entries.append(((0, 170, 220), "candidates"))
+            legend_entries.append(((0, 0, 255), "click point"))
+            self._legend_block(hier_img, legend_entries)
+
+            p_hier = os.path.join(self.run_dir, f"{ts_ms}_{action}_hierarchy.jpg")
+            cv2.imwrite(p_hier, hier_img, [int(cv2.IMWRITE_JPEG_QUALITY), 78])
+            paths["hierarchy_path"] = p_hier
+
+            # ── Image 2: OCR match + scored candidates ────────────────────────
             img1 = self.last_img.copy()
-            cv2.rectangle(img1, (ox1, oy1), (ox2, oy2), (0, 220, 255), 3)
-            cv2.putText(img1, "OCR match", (ox1, max(14, oy1 - 6)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 220, 255), 2,
-                        cv2.LINE_AA)
+            for ci, cand in enumerate(candidates_debug or []):
+                cb = cand.get("box")
+                if isinstance(cb, list) and len(cb) == 4:
+                    cbx1, cby1, cbx2, cby2 = [int(v) for v in cb]
+                    cv2.rectangle(img1, (cbx1, cby1), (cbx2, cby2), (0, 200, 255), 1)
+                    stxt = (f"#{ci+1} s={cand['_score']:.1f}" if isinstance(cand.get("_score"), float)
+                            else f"#{ci+1}")
+                    cv2.putText(img1, stxt, (cbx1, max(10, cby1 - 3)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 180, 255), 1, cv2.LINE_AA)
+            ocr_lbl = "OCR subbox" if subbox_applied else "OCR match"
+            self._draw_labeled_box(img1, [ox1, oy1, ox2, oy2], (0, 220, 255), 3, ocr_lbl)
             p1 = os.path.join(self.run_dir, f"{ts_ms}_{action}_ocr_box.jpg")
             cv2.imwrite(p1, img1, [int(cv2.IMWRITE_JPEG_QUALITY), 72])
             paths["ocr_box_path"] = p1
 
-            # Image 2: final click target (green box) + click point (red crosshair)
+            # ── Image 3: final click target + click point ─────────────────────
             img2 = self.last_img.copy()
+            for cand in (candidates_debug or []):
+                cb = cand.get("box")
+                if isinstance(cb, list) and len(cb) == 4:
+                    cbx1, cby1, cbx2, cby2 = [int(v) for v in cb]
+                    cv2.rectangle(img2, (cbx1, cby1), (cbx2, cby2), (0, 200, 255), 1)
             if [ox1, oy1, ox2, oy2] != [fx1, fy1, fx2, fy2]:
-                # show original OCR box too so the refinement is visible
                 cv2.rectangle(img2, (ox1, oy1), (ox2, oy2), (0, 220, 255), 2)
-            cv2.rectangle(img2, (fx1, fy1), (fx2, fy2), (0, 210, 0), 3)
-            cv2.circle(img2, (cx, cy), 9, (0, 0, 255), -1)
-            cv2.drawMarker(img2, (cx, cy), (0, 0, 255),
-                           cv2.MARKER_CROSS, 28, 3, cv2.LINE_AA)
+                if subbox_applied:
+                    cv2.putText(img2, "original", (ox1, max(14, oy1 - 6)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 220, 255), 1, cv2.LINE_AA)
+            box_lbl = "VLM target" if is_vlm else ("subbox" if subbox_applied else "target")
+            self._draw_labeled_box(img2, [fx1, fy1, fx2, fy2], final_color, 3, box_lbl)
+            self._draw_crosshair(img2, cx, cy)
             cv2.putText(img2, f"({cx},{cy})", (max(0, cx + 12), max(14, cy - 6)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2, cv2.LINE_AA)
             p2 = os.path.join(self.run_dir, f"{ts_ms}_{action}_click_target.jpg")
             cv2.imwrite(p2, img2, [int(cv2.IMWRITE_JPEG_QUALITY), 72])
             paths["click_target_path"] = p2
 
+            # ── Images 4+: one zoomed crop per meaningful hierarchy level ─────
+            level_paths: List[str] = []
+            click_pt_tuple = (cx, cy)
+            zoom_levels = [
+                # (box, color, label, pad_factor, draw_click)
+                (screen_box,              (180, 180, 180), "L0 screen",      0.0,  False),
+            ]
+            if parent_box and isinstance(parent_box, list) and len(parent_box) == 4:
+                zoom_levels.append(([int(v) for v in parent_box], (0, 140, 255),
+                                    "L1 parent line", 0.35, False))
+            if [ox1, oy1, ox2, oy2] != [fx1, fy1, fx2, fy2]:
+                zoom_levels.append(([ox1, oy1, ox2, oy2], (0, 220, 255),
+                                    "L2 OCR box", 0.40, False))
+            zoom_levels.append(([fx1, fy1, fx2, fy2], final_color,
+                                 "L3 target", 0.60, True))
+
+            for li, (zbox, zcol, zlbl, zpad, zdraw_click) in enumerate(zoom_levels):
+                # For the full screen level, just use a downscaled version of hierarchy
+                if li == 0:
+                    thumb = cv2.resize(hier_img, (min(img_w, 640),
+                                                   min(img_h, int(img_h * 640 / img_w))),
+                                       interpolation=cv2.INTER_AREA)
+                    bar = np.zeros((20, thumb.shape[1], 3), dtype=np.uint8)
+                    bar[:] = (40, 40, 40)
+                    cv2.putText(bar, f"L0 screen  [0,0,{img_w},{img_h}]",
+                                (4, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.40,
+                                (180, 180, 180), 1, cv2.LINE_AA)
+                    lvl_img = np.vstack([bar, thumb])
+                else:
+                    lvl_img = self._crop_level(
+                        self.last_img,
+                        zbox, zlbl, zcol,
+                        click_pt=click_pt_tuple if zdraw_click else None,
+                        pad_factor=zpad,
+                    )
+                lp = os.path.join(self.run_dir,
+                                  f"{ts_ms}_{action}_level{li}.jpg")
+                cv2.imwrite(lp, lvl_img, [int(cv2.IMWRITE_JPEG_QUALITY), 78])
+                level_paths.append(lp)
+
+            paths["level_paths"] = level_paths  # type: ignore[assignment]
             return paths
         except Exception as e:
             self._log("warn", "click.visual_debug.failed", {"error": str(e), "action": action})
@@ -1243,35 +1779,93 @@ class ActionExecutorDynamic:
                 blocker_class = result.get("blocker_class") or ""
                 recovery_strategy = result.get("recovery_strategy") or ""
                 recovery_effect = result.get("recovery_effect") or ""
+                box_origin = result.get("box_origin") or ""
                 frame = it.get("frame_path") or ""
                 post_frame = it.get("post_frame_path") or ""
                 crop = it.get("crop_overlay_path") or ""
-                ocr_box_ov = it.get("ocr_box_overlay_path") or ""
-                click_tgt_ov = it.get("click_target_overlay_path") or ""
-                imgs = []
-                # Full-frame click debug images (click_text / click_any_text / click_near_text)
+                hierarchy_ov   = it.get("hierarchy_overlay_path") or ""
+                ocr_box_ov     = it.get("ocr_box_overlay_path") or ""
+                click_tgt_ov   = it.get("click_target_overlay_path") or ""
+                level_paths    = it.get("level_overlay_paths") or []
+
+                subbox_applied = bool(result.get("subbox_applied", False))
+                vlm_used       = bool(result.get("vlm_used", False))
+                synth_failed   = bool(result.get("synthetic_refine_failed", False))
+                subbox_lbl = ' <span class="tag tag-subbox">subbox</span>' if subbox_applied else ""
+                vlm_lbl    = ' <span class="tag tag-vlm">VLM</span>'       if vlm_used       else ""
+                synth_lbl  = ' <span class="tag tag-synth">synth!</span>'  if synth_failed   else ""
+                origin_lbl = f' <span class="tag tag-origin">{box_origin}</span>' if box_origin else ""
+
+                ocr_box_val  = result.get("ocr_box") or ""
+                click_abs_val = result.get("click_abs") or result.get("clicked_abs") or ""
+
+                is_click_action = executed_action in (
+                    "click_text", "click_any_text", "click_near_text",
+                    "click_box", "click_text_vlm", "click_box_biased",
+                )
+
+                # ── Image sections ────────────────────────────────────────────
+                # Section A: hierarchy + drill-down levels (click actions only)
+                hier_html = ""
+                if is_click_action and hierarchy_ov:
+                    # Wide hierarchy composite (spans full card width)
+                    hier_html += (
+                        f'<div class="hier-row">'
+                        f'<figure class="hier-fig">'
+                        f'<img src="{os.path.basename(hierarchy_ov)}" alt="hierarchy"/>'
+                        f'<figcaption>&#9660; box hierarchy (all levels)</figcaption>'
+                        f'</figure></div>'
+                    )
+                    # Drill-down level crops in a separate row
+                    if level_paths:
+                        level_figs = "".join(
+                            f'<figure><img src="{os.path.basename(lp)}" alt="L{li}"/>'
+                            f'<figcaption>{'L0 screen' if li==0 else f'L{li} zoom'}</figcaption></figure>'
+                            for li, lp in enumerate(level_paths) if lp
+                        )
+                        n_lvls = len([lp for lp in level_paths if lp])
+                        hier_html += (
+                            f'<div class="level-row" style="grid-template-columns:repeat({n_lvls},1fr)">'
+                            f'{level_figs}</div>'
+                        )
+
+                # Section B: standard before/after frames + OCR/target overlays
+                std_imgs = []
                 if ocr_box_ov:
-                    imgs.append(
+                    std_imgs.append(
                         f'<figure><img src="{os.path.basename(ocr_box_ov)}" alt="ocr box"/>'
-                        f'<figcaption>OCR match</figcaption></figure>'
+                        f'<figcaption>OCR candidates</figcaption></figure>'
                     )
                 if click_tgt_ov:
-                    imgs.append(
+                    std_imgs.append(
                         f'<figure><img src="{os.path.basename(click_tgt_ov)}" alt="click target"/>'
                         f'<figcaption>click target</figcaption></figure>'
                     )
-                # Legacy crop overlay (fall back if no full-frame overlays)
                 if crop and not (ocr_box_ov or click_tgt_ov):
-                    imgs.append(
-                        f'<figure><img src="{os.path.basename(crop)}" alt="crop overlay"/>'
+                    std_imgs.append(
+                        f'<figure><img src="{os.path.basename(crop)}" alt="crop"/>'
                         f'<figcaption>target (crop)</figcaption></figure>'
                     )
                 if frame:
-                    imgs.append(f'<figure><img src="{os.path.basename(frame)}" alt="frame"/><figcaption>before</figcaption></figure>')
+                    std_imgs.append(
+                        f'<figure><img src="{os.path.basename(frame)}" alt="before"/>'
+                        f'<figcaption>before</figcaption></figure>'
+                    )
                 if post_frame:
-                    imgs.append(f'<figure><img src="{os.path.basename(post_frame)}" alt="post frame"/><figcaption>after</figcaption></figure>')
-                img_html = "".join(imgs) if imgs else '<div class="noimg">no image</div>'
-                n_imgs = len(imgs)
+                    std_imgs.append(
+                        f'<figure><img src="{os.path.basename(post_frame)}" alt="after"/>'
+                        f'<figcaption>after</figcaption></figure>'
+                    )
+                std_cols = max(2, min(4, len(std_imgs)))
+                std_html = ""
+                if std_imgs:
+                    std_html = (
+                        f'<div class="imgs" style="grid-template-columns:repeat({std_cols},1fr)">'
+                        + "".join(std_imgs) + "</div>"
+                    )
+                elif not hier_html:
+                    std_html = '<div class="noimg">no image</div>'
+
                 card_cls = "card"
                 if status == "success" and outcome_verified:
                     card_cls += " ok"
@@ -1279,31 +1873,31 @@ class ActionExecutorDynamic:
                     card_cls += " warn"
                 else:
                     card_cls += " bad"
-                ocr_box_val = result.get("ocr_box") or ""
-                click_abs_val = result.get("click_abs") or result.get("clicked_abs") or ""
-                img_cols = max(2, min(4, n_imgs))
+                if is_click_action:
+                    card_cls += " click-card"
+
                 cards.append(
                     f"""
 <div class="{card_cls}">
   <div class="hdr">
     <div class="idx">#{idx}</div>
-    <div class="meta">{ts} · <b>{executed_action}</b> · {status}</div>
+    <div class="meta">{ts} · <b>{executed_action}</b> · {status}{subbox_lbl}{vlm_lbl}{synth_lbl}{origin_lbl}</div>
   </div>
-  <div class="imgs" style="grid-template-columns:repeat({img_cols},1fr)">{img_html}</div>
+  {hier_html}
+  {std_html}
   <div class="txt"><b>planner</b> {planner_action} {planner_params}</div>
   <div class="txt"><b>executed</b> {executed_action} {executed_params}</div>
   <div class="txt"><b>why</b> {why}</div>
   <div class="txt"><b>verification</b> applied={event_applied} verified={outcome_verified} reason={verification_reason}</div>
   <div class="txt"><b>blocker</b> {blocker_class}</div>
   <div class="txt"><b>recovery</b> strategy={recovery_strategy} effect={recovery_effect}</div>
-  <div class="txt"><b>targeting</b> {targeting_source}</div>
-  <div class="txt"><b>ocr box</b> {ocr_box_val}</div>
-  <div class="txt"><b>click abs</b> {click_abs_val}</div>
+  <div class="txt"><b>targeting</b> {targeting_source}{subbox_lbl}{vlm_lbl}{synth_lbl}</div>
+  <div class="txt"><b>ocr box</b> {ocr_box_val}  <b>click abs</b> {click_abs_val}  <b>origin</b> {box_origin}</div>
   <div class="txt"><b>override</b> {executor_override_reason}</div>
   <div class="txt"><b>evidence</b> {verification_evidence}</div>
   <div class="txt"><b>before tags</b> {before_state.get("tags", [])}</div>
   <div class="txt"><b>after tags</b> {after_state.get("tags", [])}</div>
-  <div class="txt"><b>focus</b> {focus_before} -> {focus_after}</div>
+  <div class="txt"><b>focus</b> {focus_before} → {focus_after}</div>
 </div>
 """
                 )
@@ -1311,41 +1905,78 @@ class ActionExecutorDynamic:
 <html><head><meta charset="utf-8"/>
 <title>Agent trace</title>
 <style>
-body {{ font-family: system-ui, Arial, sans-serif; margin: 16px; }}
-.grid {{ display:grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }}
-@media (min-width:1600px) {{ .grid {{ grid-template-columns: repeat(4, 1fr); }} }}
-.card {{ border:1px solid #ddd; border-radius:10px; padding:10px; background:#fff; }}
-.card.ok {{ border-color:#9ad0a0; background:#f5fff6; }}
+body {{ font-family: system-ui, Arial, sans-serif; margin: 16px; background:#f0f2f5; }}
+.grid {{ display:grid; grid-template-columns: repeat(2, 1fr); gap: 16px; }}
+@media (min-width:1600px) {{ .grid {{ grid-template-columns: repeat(3, 1fr); }} }}
+/* Click cards are wider — they span 2 columns on the 3-col layout */
+@media (min-width:1600px) {{ .click-card {{ grid-column: span 2; }} }}
+.card {{ border:1px solid #ddd; border-radius:10px; padding:10px; background:#fff;
+         box-shadow:0 1px 4px rgba(0,0,0,.08); }}
+.card.ok   {{ border-color:#9ad0a0; background:#f5fff6; }}
 .card.warn {{ border-color:#e9c46a; background:#fffaf0; }}
-.card.bad {{ border-color:#ef9a9a; background:#fff5f5; }}
-.hdr {{ display:flex; justify-content:space-between; align-items:baseline; gap:8px; }}
-.idx {{ font-weight:700; }}
+.card.bad  {{ border-color:#ef9a9a; background:#fff5f5; }}
+.hdr {{ display:flex; justify-content:space-between; align-items:baseline; gap:8px; margin-bottom:6px; }}
+.idx {{ font-weight:700; font-size:16px; }}
 .meta {{ font-size:12px; color:#333; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
-.imgs {{ display:grid; grid-template-columns: repeat(2, 1fr); gap: 6px; margin-top: 8px; }}
+/* Hierarchy composite — full card width */
+.hier-row {{ margin:4px 0 6px; }}
+.hier-fig {{ margin:0; width:100%; }}
+.hier-fig img {{ width:100%; height:auto; border-radius:6px; border:2px solid #aaa; cursor:zoom-in; }}
+.hier-fig figcaption {{ font-size:11px; font-weight:600; color:#555; text-align:center;
+                         margin-top:3px; letter-spacing:.04em; }}
+/* Drill-down level crops */
+.level-row {{ display:grid; gap:4px; margin:4px 0 6px; }}
+.level-row figure {{ margin:0; }}
+.level-row figcaption {{ font-size:10px; color:#888; text-align:center; margin-top:2px; }}
+.level-row img {{ width:100%; height:auto; border-radius:4px; border:1px solid #ccc; cursor:zoom-in; }}
+/* Standard images grid */
+.imgs {{ display:grid; gap:6px; margin:4px 0 6px; }}
 figure {{ margin:0; }}
 figcaption {{ font-size:11px; color:#666; margin-top:3px; text-align:center; }}
 img {{ width:100%; height:auto; border-radius:6px; background:#f6f6f6; cursor:zoom-in; }}
 img:hover {{ outline:2px solid #4a90d9; }}
-.txt {{ font-size:12px; color:#222; margin-top:6px; word-break:break-word; }}
+.txt {{ font-size:12px; color:#222; margin-top:5px; word-break:break-word; }}
 .noimg {{ font-size:12px; color:#777; padding:18px; text-align:center; border:1px dashed #ccc; border-radius:8px; }}
+.tag {{ display:inline-block; font-size:10px; font-weight:700; padding:1px 5px; border-radius:3px; margin-left:4px; vertical-align:middle; }}
+.tag-subbox  {{ background:#e0f4ff; color:#0077bb; border:1px solid #99d0f0; }}
+.tag-vlm     {{ background:#f4e0ff; color:#8800cc; border:1px solid #d0a0f0; }}
+.tag-synth   {{ background:#fff0d0; color:#aa5500; border:1px solid #f0c060; }}
+.tag-origin  {{ background:#e8ffe8; color:#226622; border:1px solid #88cc88; font-size:9px; }}
 /* lightbox */
-#lb {{ display:none; position:fixed; inset:0; background:rgba(0,0,0,.82); z-index:9999; align-items:center; justify-content:center; cursor:zoom-out; }}
+#lb {{ display:none; position:fixed; inset:0; background:rgba(0,0,0,.88); z-index:9999;
+       align-items:center; justify-content:center; cursor:zoom-out; flex-direction:column; gap:8px; }}
 #lb.open {{ display:flex; }}
-#lb img {{ max-width:95vw; max-height:95vh; border-radius:8px; box-shadow:0 4px 32px rgba(0,0,0,.6); }}
+#lb img {{ max-width:96vw; max-height:90vh; border-radius:8px; box-shadow:0 4px 32px rgba(0,0,0,.7); }}
+#lb-caption {{ color:#eee; font-size:13px; font-family:monospace; }}
 </style></head>
 <body>
-<h2>Last {len(items)} actions (auto-updated)</h2>
-<div id="lb"><img id="lb-img" src="" alt=""/></div>
+<h2 style="margin-bottom:12px">Last {len(items)} actions
+  <span style="font-size:13px;font-weight:400;color:#888">(auto-updated · click any image to zoom)</span>
+</h2>
+<div id="lb">
+  <img id="lb-img" src="" alt=""/>
+  <div id="lb-caption"></div>
+</div>
 <div class="grid">
 {''.join(cards)}
 </div>
 <script>
-var lb=document.getElementById('lb'),lbi=document.getElementById('lb-img');
-document.querySelectorAll('.imgs img').forEach(function(img){{
-  img.addEventListener('click',function(e){{e.stopPropagation();lbi.src=img.src;lb.classList.add('open');}});
+var lb=document.getElementById('lb'),
+    lbi=document.getElementById('lb-img'),
+    lbc=document.getElementById('lb-caption');
+document.querySelectorAll('img').forEach(function(img){{
+  img.addEventListener('click',function(e){{
+    e.stopPropagation();
+    lbi.src=img.src;
+    var cap=img.closest('figure');
+    lbc.textContent=cap ? (cap.querySelector('figcaption')||{{}}).textContent||'' : '';
+    lb.classList.add('open');
+  }});
 }});
-lb.addEventListener('click',function(){{lb.classList.remove('open');lbi.src='';}});
-document.addEventListener('keydown',function(e){{if(e.key==='Escape'){{lb.classList.remove('open');lbi.src='';}}}});
+lb.addEventListener('click',function(){{lb.classList.remove('open');lbi.src='';lbc.textContent='';}});
+document.addEventListener('keydown',function(e){{
+  if(e.key==='Escape'){{lb.classList.remove('open');lbi.src='';lbc.textContent='';}}
+}});
 </script>
 </body></html>"""
             with open(self.trace_html_path, "w", encoding="utf-8") as f:
@@ -1497,20 +2128,210 @@ document.addEventListener('keydown',function(e){{if(e.key==='Escape'){{lb.classL
                 cx = min(w - 40, max(40, bx2 + 80))
         return [max(0, cx - 12), max(0, cy - 12), min(w, cx + 12), min(h, cy + 12)]
 
+    # Words that appear exclusively on safe/confirm dismiss buttons.
+    _BUTTON_EXACT_RE = re.compile(
+        r'^(ok|okay|close|yes|continue|dismiss|accept|allow|done|got it|'
+        r'close firefox|open new session|start new session|confirm|apply|update|later)$',
+        re.I
+    )
+    # Words that can appear on dismiss buttons but may also occur in body text.
+    _BUTTON_PARTIAL_RE = re.compile(
+        r'\b(ok|okay|close|yes|no|cancel|continue|dismiss|accept|allow|deny|'
+        r'try again|later|update|apply|confirm|submit|done|got it|close firefox|'
+        r'open new session|start new session|quit)\b',
+        re.I
+    )
+
     def _preferred_resolve_target(self, snapshot: Dict[str, Any], blocker: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """
+        Pick the best resolve target to click in order to dismiss a blocker.
+
+        Uses a continuous numeric score (lower = better candidate) derived from:
+
+          1. OCR text match quality
+             • Exact-match on known button words → 0
+             • Partial-match                     → 10
+             • No match                          → 30
+
+          2. Clickability geometry (must pass minimum dimensions to qualify):
+             min width ≥ 40px, min height ≥ 16px,
+             aspect ratio 1.5 ≤ w/h ≤ 15,
+             area < 25 000 px² and height < 60px  → strong button bonus (-15)
+
+          3. Proximity to modal footer: boxes whose Y-centre is in the lower 30%
+             of the screen image get a -8 bonus.
+
+          4. OCR confidence: each 10-point confidence above 50 removes 1 from score.
+
+          5. Area (as a tie-breaker on a log scale): smaller is better, but artifacts
+             (area < 500 or w < 40 or h < 16) are penalised +50 to filter them out.
+
+        Reverses the old "largest area wins" order that caused the agent to click
+        dialog body text instead of the dismiss button.
+        """
         if blocker is None:
             return None
+
+        # Fix K: For browser-chrome blockers (permission prompts, session restore),
+        # prefer A11y button nodes over OCR boxes — they give precise hit-target coords.
+        blocker_class_k = str(blocker.get("class", "") or "")
+        if A11Y_BRIDGE_URL and self.last_ax_nodes:
+            # Collect the expected button label words from all resolve targets
+            ax_labels = []
+            for rt in (blocker.get("resolve_targets") or []):
+                lbl = str(rt.get("label", "") or rt.get("text", "") or "")
+                if lbl:
+                    ax_labels.append(lbl)
+            # Add class-specific fallback labels
+            if blocker_class_k == "browser_session_restore":
+                ax_labels += ["Start New Session", "Restore Session", "start new", "restore"]
+            elif blocker_class_k == "browser_permission_prompt":
+                ax_labels += ["Allow", "Block", "Don't Allow", "Not Now"]
+            elif blocker_class_k in ("modal_dialog", "cookie_banner"):
+                ax_labels += ["OK", "Close", "Accept", "Dismiss", "Allow", "Got it"]
+            if ax_labels:
+                ax_btn = self._ax_best_button_for_labels(ax_labels)
+                if ax_btn:
+                    self._last_resolve_candidates = [{"box": ax_btn["box"], "text": ax_btn["text"], "_score": -100.0}]
+                    return ax_btn
+
+        img_h = int(self.last_img.shape[0]) if self.last_img is not None else 900
+
         candidates: List[Dict[str, Any]] = []
         for target in blocker.get("resolve_targets") or []:
             box = target.get("box") if isinstance(target.get("box"), list) else None
             scope = self._target_scope_from_box(box, snapshot, blocker)
-            area = int(target.get("area") or 0)
             if box and scope == "page_content":
-                candidates.append(dict(target, scope=scope, area=area))
+                bw   = max(1, int(box[2]) - int(box[0]))
+                bh   = max(1, int(box[3]) - int(box[1]))
+                area = bw * bh
+                cy   = (int(box[1]) + int(box[3])) / 2.0
+                candidates.append(dict(target, scope=scope, area=area, _bw=bw, _bh=bh, _cy=cy))
         if not candidates:
             return None
-        candidates.sort(key=lambda item: (-int(bool(item.get("dual_purpose"))), -int(item.get("area", 0))))
-        return candidates[0]
+
+        import math
+
+        def _score(c: Dict[str, Any]) -> float:
+            text  = str(c.get("text", "") or c.get("label", "") or "")
+            area  = int(c.get("area", 0))
+            bh    = int(c.get("_bh", 999))
+            bw    = int(c.get("_bw", 9999))
+            cy    = float(c.get("_cy", img_h / 2))
+            conf  = int(c.get("conf", 50))          # OCR confidence 0-100
+
+            score = 0.0
+
+            # ── 1. Text quality ──────────────────────────────────────────────
+            text_stripped = text.strip()
+            if self._BUTTON_EXACT_RE.match(text_stripped):
+                score += 0.0          # best: exact button label
+            elif self._BUTTON_PARTIAL_RE.search(text):
+                score += 10.0         # partial match in longer text
+            else:
+                score += 30.0         # no button keyword found
+
+            # ── 2. Geometry / clickability ───────────────────────────────────
+            # Hard artifact filter (penalise, don't discard so we always return something)
+            if area < 500 or bw < 40 or bh < 16:
+                score += 50.0
+            else:
+                aspect = bw / max(1, bh)
+                good_aspect = 1.5 <= aspect <= 15.0
+                good_size   = bh < 60 and bw < 500 and area < 25_000
+                if good_size and good_aspect:
+                    score -= 15.0     # strong button-shape bonus
+                elif good_size or good_aspect:
+                    score -= 5.0      # partial geometry match
+
+            # ── 3. Proximity to modal footer ─────────────────────────────────
+            if cy >= img_h * 0.65:
+                score -= 8.0          # near-bottom bonus
+
+            # ── 4. OCR confidence ────────────────────────────────────────────
+            score -= max(0.0, (conf - 50) / 10.0)
+
+            # ── 5. Fix H: Line-box ambiguity penalties ───────────────────────
+            # Penalise boxes that are wide relative to their text length (OCR row
+            # boxes rather than tight button hit-targets).
+            n_chars = max(1, len(text.strip()))
+            w_per_char = bw / n_chars
+            if w_per_char > 18:
+                # Wide-per-character: classic row/line box (e.g. 800 px for 5 chars)
+                score += min(30.0, (w_per_char - 18) * 1.5)
+
+            aspect = bw / max(1, bh)
+            if aspect > 20:
+                # Extreme horizontal aspect ratio → almost certainly a row strip
+                score += 20.0
+
+            # Multi-action label: if the text contains ≥2 button words it's probably
+            # a merged line like "Start New Session  Restore Session"
+            n_action_words = len(self._BUTTON_PARTIAL_RE.findall(text))
+            if n_action_words >= 2:
+                score += 15.0
+
+            # ── 6. Area tie-breaker (log scale, smaller preferred) ───────────
+            score += math.log1p(area) * 0.4
+
+            return score
+
+        # Attach computed score to each candidate (for trace/debug visualization)
+        for c in candidates:
+            c["_score"] = _score(c)
+        candidates.sort(key=lambda c: c["_score"])
+        best = candidates[0]
+        # Expose scored candidates as a class-level attribute for visual debug
+        self._last_resolve_candidates = [
+            {"box": c.get("box"), "text": c.get("text", ""), "_score": c["_score"]}
+            for c in candidates
+        ]
+        # Strip internal scoring keys before returning
+        return {k: v for k, v in best.items() if not k.startswith("_")}
+
+    # Words on-screen that indicate the default action for Enter could be destructive
+    # (e.g. delete, discard, quit). In those dialogs Escape should be tried first.
+    _DESTRUCTIVE_DIALOG_RE = re.compile(
+        r'\b(delete|remove|discard|quit|leave|uninstall|format|erase|wipe|'
+        r'permanently|lose|overwrite)\b',
+        re.I
+    )
+    # Words that confirm this dialog is a safe session-restore / continue dialog
+    # where Enter is the right first move.
+    _SAFE_RESTORE_RE = re.compile(
+        r'\b(restore|reopen|continue|session|tabs?|windows?)\b',
+        re.I
+    )
+
+    def _keyboard_escalation_key_order(self, blocker_class: str) -> List[str]:
+        """
+        Return [first_key, second_key] for keyboard escalation.
+
+        Logic:
+        • session-restore dialogs → Enter is always safe (restores tabs, not destructive).
+        • Any dialog whose visible OCR text contains destructive words (delete / quit …)
+          → try Escape first, then Enter only as a last resort.
+        • Default (unknown / safe) → Enter first, then Escape.
+        """
+        if blocker_class == "browser_session_restore":
+            return ["Return", "Escape"]
+
+        # Collect all visible OCR text from the current frame.
+        ocr_texts: List[str] = []
+        for w in (self.last_ocr_words or []):
+            t = str(w.get("text", "") or "")
+            if t:
+                ocr_texts.append(t)
+        if not ocr_texts:
+            for w in (self.last_ocr or []):
+                t = str(w.get("text", "") or "")
+                if t:
+                    ocr_texts.append(t)
+        joined = " ".join(ocr_texts)
+
+        if self._DESTRUCTIVE_DIALOG_RE.search(joined) and not self._SAFE_RESTORE_RE.search(joined):
+            return ["Escape", "Return"]
+        return ["Return", "Escape"]
 
     def _crop_ocr_refine_target(
         self,
@@ -1574,6 +2395,152 @@ document.addEventListener('keydown',function(e){{if(e.key==='Escape'){{lb.classL
             "scope": target.get("scope", ""),
         }
 
+    def _refine_synthetic_target(
+        self,
+        target: Dict[str, Any],
+        *,
+        regex: Optional[str] = None,
+        any_regex: Optional[List[str]] = None,
+        fuzzy_text: Optional[str] = None,
+        fuzzy_threshold: Optional[float] = None,
+        prefer_bold: bool = False,
+        nth: int = 0,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Fix M: When a match originated from a synthetic sub-box (synth_word or
+        line_subbox), the proportional geometry may be wrong for grid/tile UIs.
+
+        Strategy: crop around the *parent* line box (not the tiny sub-box), upscale
+        2-3×, run real OCR, re-run find_text_box().  Map the result back to image
+        space.  If a real word box is found, return it; otherwise return None so the
+        caller can try VLM.
+        """
+        if self.last_img is None:
+            return None
+        origin = str(target.get("_origin", "") or "")
+        if origin not in BOX_ORIGINS_SYNTHETIC:
+            return None  # Only refine synthetic origins
+
+        # Use the parent line box as the crop region (much wider than the sub-box)
+        parent_box = target.get("_parent_box")
+        crop_box = parent_box if isinstance(parent_box, list) and len(parent_box) == 4 else target.get("box")
+        if not isinstance(crop_box, list) or len(crop_box) != 4:
+            return None
+
+        px1, py1, px2, py2 = [int(v) for v in crop_box]
+        img_h, img_w = self.last_img.shape[:2]
+        # Add generous vertical padding so text above/below the line is included
+        v_pad = max(20, int((py2 - py1) * 0.5))
+        h_pad = max(24, int((px2 - px1) * 0.1))
+        left   = max(0, px1 - h_pad)
+        top    = max(0, py1 - v_pad)
+        right  = min(img_w, px2 + h_pad)
+        bottom = min(img_h, py2 + v_pad)
+        if right - left < 16 or bottom - top < 8:
+            return None
+
+        crop = self.last_img[top:bottom, left:right].copy()
+        # Upscale if the crop is small (tile grids often have small text)
+        crop_h, crop_w = crop.shape[:2]
+        scale = 3 if crop_h < 80 else (2 if crop_h < 160 else 1)
+        if scale > 1:
+            crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
+        crop_levels = ocr_image_levels(crop)
+        crop_words = list(crop_levels.get("words") or [])
+        crop_lines = list(crop_levels.get("lines") or [])
+
+        refined = find_text_box(
+            crop_words,
+            line_items=crop_lines,
+            regex=regex,
+            any_regex=any_regex,
+            fuzzy_text=fuzzy_text,
+            fuzzy_threshold=fuzzy_threshold,
+            prefer_bold=prefer_bold,
+            nth=nth,
+        )
+        if not refined:
+            return None
+
+        # Accept only if the refined result is not also synthetic
+        refined_origin = str(refined.get("_origin", "") or "")
+        if refined_origin in BOX_ORIGINS_SYNTHETIC:
+            return None
+
+        rx1, ry1, rx2, ry2 = [int(v) for v in refined.get("box", [0, 0, 0, 0])]
+        mapped_box = [
+            int(left + rx1 / scale),
+            int(top  + ry1 / scale),
+            int(left + rx2 / scale),
+            int(top  + ry2 / scale),
+        ]
+        self._log("info", "refine_synthetic.found", {
+            "original_origin": origin,
+            "refined_origin": refined_origin,
+            "parent_box": crop_box,
+            "refined_box": mapped_box,
+            "text": refined.get("text", ""),
+        })
+        return {
+            "text": refined.get("text", target.get("text", "")),
+            "box": mapped_box,
+            "level": f"{refined.get('level', 'word')}_synth_refined",
+            "_origin": "raw_word",  # promoted to trusted after real OCR
+            "scope": target.get("scope", ""),
+            "_subbox_applied": False,
+        }
+
+    def _validate_click_box(
+        self,
+        box: List[int],
+        desired_text: str,
+        *,
+        pad_factor: float = 1.8,
+    ) -> bool:
+        """
+        Fix N: Cheap pre-click validation.  Crops a window around the final box,
+        runs OCR, and checks that the desired text is present inside the crop.
+
+        Returns True if text is confirmed (or if validation cannot be run), so
+        callers can treat True as "proceed" and False as "targeting failure".
+        """
+        if self.last_img is None or not desired_text:
+            return True  # Can't validate — assume OK
+        try:
+            x1, y1, x2, y2 = [int(v) for v in box]
+            bw, bh = max(1, x2 - x1), max(1, y2 - y1)
+            img_h, img_w = self.last_img.shape[:2]
+            pad_x = max(16, int(bw * (pad_factor - 1) / 2))
+            pad_y = max(16, int(bh * (pad_factor - 1) / 2))
+            left   = max(0, x1 - pad_x)
+            top    = max(0, y1 - pad_y)
+            right  = min(img_w, x2 + pad_x)
+            bottom = min(img_h, y2 + pad_y)
+            if right - left < 8 or bottom - top < 8:
+                return True
+            crop = self.last_img[top:bottom, left:right].copy()
+            scale = 2 if max(bw, bh) <= 100 else 1
+            if scale > 1:
+                crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+            crop_levels = ocr_image_levels(crop)
+            crop_words = list(crop_levels.get("words") or []) + list(crop_levels.get("lines") or [])
+            all_text = " ".join(str(w.get("text", "") or "") for w in crop_words).lower()
+            target_lower = desired_text.strip().lower()
+            # Fuzzy: require at least 70% of the target chars to appear in the crop text
+            found = target_lower in all_text
+            if not found:
+                score = fuzz.partial_ratio(target_lower, all_text)
+                found = score >= 70
+            self._log("debug", "validate_click_box", {
+                "box": box, "desired": desired_text,
+                "crop_text_snippet": all_text[:120], "found": found,
+            })
+            return found
+        except Exception as e:
+            self._log("warn", "validate_click_box.error", {"error": str(e)})
+            return True  # On error, proceed rather than block
+
     def _maybe_refine_click_target(
         self,
         action: str,
@@ -1582,24 +2549,23 @@ document.addEventListener('keydown',function(e){{if(e.key==='Escape'){{lb.classL
         blocker: Optional[Dict[str, Any]],
         target: Optional[Dict[str, Any]],
     ) -> Optional[Dict[str, Any]]:
-        if not target or str(target.get("scope", "")) != "browser_chrome":
+        if not target:
             return target
         box = target.get("box")
         if not isinstance(box, list) or len(box) != 4:
             return target
-        width = max(1, int(box[2]) - int(box[0]))
-        height = max(1, int(box[3]) - int(box[1]))
-        tiny_target = width <= 140 and height <= 36
-        if action not in ("click_text", "click_any_text", "click_near_text") or not tiny_target:
-            return target
 
-        regex = params.get("regex")
+        scope = str(target.get("scope", "") or "")
+        origin = str(target.get("_origin", "") or "")
+        width  = max(1, int(box[2]) - int(box[0]))
+        height = max(1, int(box[3]) - int(box[1]))
+
+        regex     = params.get("regex")
         any_regex = params.get("patterns")
         if action == "click_near_text":
-            regex = params.get("anchor_regex")
+            regex     = params.get("anchor_regex")
             any_regex = None
-        refined = self._crop_ocr_refine_target(
-            target,
+        kwargs = dict(
             regex=regex,
             any_regex=any_regex if isinstance(any_regex, list) else None,
             fuzzy_text=params.get("fuzzy_text"),
@@ -1607,7 +2573,26 @@ document.addEventListener('keydown',function(e){{if(e.key==='Escape'){{lb.classL
             prefer_bold=bool(params.get("prefer_bold", False)),
             nth=int(params.get("nth", 0)),
         )
-        return refined or target
+
+        # Fix M: Synthetic origin on page_content → mandatory real OCR refinement
+        if (
+            action in ("click_text", "click_any_text", "click_near_text")
+            and origin in BOX_ORIGINS_SYNTHETIC
+            and scope != "browser_chrome"  # browser_chrome handled below
+        ):
+            refined = self._refine_synthetic_target(target, **kwargs)
+            if refined:
+                return refined
+            # Could not refine — caller will invoke VLM fallback
+
+        # Original chrome refinement logic (unchanged)
+        if scope == "browser_chrome":
+            tiny_target = width <= 140 and height <= 36
+            if action in ("click_text", "click_any_text", "click_near_text") and tiny_target:
+                refined = self._crop_ocr_refine_target(target, **kwargs)
+                return refined or target
+
+        return target
 
     def _should_send_planner_screenshot(self, snapshot: Dict[str, Any]) -> bool:
         mode = (PLANNER_SEND_SCREENSHOT_MODE or "auto").lower()
@@ -1634,6 +2619,42 @@ document.addEventListener('keydown',function(e){{if(e.key==='Escape'){{lb.classL
         if len(self.last_ocr_words) < 6 and len(self.last_ocr_lines) < 3:
             return True
         return False
+
+    def _ax_best_button_for_labels(self, labels: List[str]) -> Optional[Dict[str, Any]]:
+        """
+        Fix K: Search the A11y tree for a node with role 'button' (or similar clickable
+        role) whose accessible name matches one of the provided label patterns.
+
+        Returns a dict with 'box', 'text', and 'source'='ax' or None.
+        Used to prefer precise A11y coords for browser-chrome blockers over OCR line boxes.
+        """
+        if not self.last_ax_nodes:
+            return None
+        clickable_roles = {"button", "link", "menuitem", "option", "checkbox", "radio",
+                           "tab", "treeitem", "listitem", "menuitemcheckbox", "menuitemradio"}
+        label_pats = [re.compile(lb, re.I) for lb in labels]
+        best: Optional[Dict[str, Any]] = None
+        for node in self.last_ax_nodes:
+            role = str(node.get("role", "") or "").lower()
+            if role not in clickable_roles:
+                continue
+            name = str(node.get("name", "") or node.get("value", "") or "")
+            if not any(p.search(name) for p in label_pats):
+                continue
+            box = node.get("box")
+            if not isinstance(box, list) or len(box) != 4:
+                continue
+            bw = max(1, int(box[2]) - int(box[0]))
+            bh = max(1, int(box[3]) - int(box[1]))
+            area = bw * bh
+            if area < 16:
+                continue
+            # Prefer the smallest matching button (tightest hit target)
+            if best is None or area < (max(1, (best["box"][2]-best["box"][0]) * (best["box"][3]-best["box"][1]))):
+                best = {"box": [int(v) for v in box], "text": name, "source": "ax", "role": role}
+        if best:
+            self._log("info", "ax.button_found", {"text": best["text"], "box": best["box"], "role": best["role"]})
+        return best
 
     def _match_resolve_target(self, blocker: Dict[str, Any], target: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         if not target:
@@ -1865,22 +2886,51 @@ document.addEventListener('keydown',function(e){{if(e.key==='Escape'){{lb.classL
             }
 
         if blocker_class == "browser_url_suggestion_dropdown":
-            if strategy == "click_visible_page_target":
-                return allow("page_target_click_can_clear_chrome_dropdown")
+            # Fix P: Deterministic dismissal before any page-content click.
+            # A click on page content while the dropdown is open is often "consumed"
+            # by the dropdown and does NOT activate the underlying target.
+            # Strategy: always send Esc first (up to 2 times); only then allow the
+            # page click through. This is more reliable than "click and hope".
+            esc_count = counts.get("escape", 0)
+
+            # Explicit escape action always allowed up to 2 attempts
+            if strategy == "escape" and esc_count < 2:
+                return allow("dropdown_escape_allowed")
+
+            # open_url bypasses the whole dropdown problem entirely
             if strategy == "open_url":
                 return allow("open_url_bypasses_browser_dropdown")
-            if strategy == "escape" and counts.get("escape", 0) < 1:
-                return allow("first_escape_attempt_allowed_for_browser_dropdown")
-            if strategy == "click_browser_chrome" and counts.get("click_browser_chrome", 0) < 1:
-                return allow("single_browser_chrome_refocus_attempt_allowed")
-            if strategy == "refocus_urlbar" and counts.get("refocus_urlbar", 0) < 1:
-                return allow("single_urlbar_refocus_attempt_allowed")
+
+            # Type/submit only allowed after dropdown is already dismissed
             if strategy == "type" and focus.get("focused_editable"):
                 return allow("typing_allowed_once_focus_is_editable")
             if strategy == "submit_key" and focus.get("focused_editable") and counts.get("submit_key", 0) < 1:
                 return allow("submit_allowed_when_editable_focus_confirms_intent")
-            if counts.get("escape", 0) < 1:
+
+            # Fix P: If we need to click a page target or browser chrome but haven't
+            # sent Esc yet, send Esc first.  After Esc is confirmed (esc_count >= 1),
+            # the next cycle will re-detect the state; if dropdown is gone, the
+            # original action will be allowed normally.
+            if strategy in ("click_visible_page_target", "click_browser_chrome"):
+                if esc_count < 1:
+                    return override(
+                        "key_seq", {"keys": ["Escape"]},
+                        "fix_p_esc_before_page_click_to_dismiss_dropdown", "escape",
+                    )
+                if esc_count < 2:
+                    # Second Esc attempt if dropdown persisted after first
+                    return override(
+                        "key_seq", {"keys": ["Escape"]},
+                        "fix_p_second_esc_dropdown_still_present", "escape",
+                    )
+                # Dropdown survived two Esc presses — allow the click as last resort
+                return allow("dropdown_survived_two_esc_allow_page_click")
+
+            # For anything else: send Esc if not yet tried
+            if esc_count < 1:
                 return override("key_seq", {"keys": ["Escape"]}, "browser_dropdown_first_try_escape", "escape")
+            if strategy == "refocus_urlbar" and counts.get("refocus_urlbar", 0) < 1:
+                return allow("single_urlbar_refocus_attempt_allowed")
             click_away_box = self._page_click_away_box(snapshot, blocker)
             if click_away_box and counts.get("click_away_page", 0) < 1:
                 return override("click_box", {"box": click_away_box}, "browser_dropdown_try_click_away", "click_away_page")
@@ -1890,19 +2940,91 @@ document.addEventListener('keydown',function(e){{if(e.key==='Escape'){{lb.classL
 
         if blocker_class == "browser_session_restore":
             preferred_target = self._preferred_resolve_target(snapshot, blocker)
+
+            # Allow planner's explicit click_text resolve that landed on page content.
             if strategy == "click_visible_resolve_target":
                 matched = self._match_resolve_target(blocker or {}, target)
                 if matched is not None and str((target or {}).get("scope", "")) == "page_content":
                     return allow("page_level_session_restore_resolve_target_selected")
+
+            # FIX B: If the planner sent an explicit click_box with a more precise target
+            # than our preferred CTA, trust the planner and skip the override.
+            # Priority order for checks:
+            #   1. Containment: planner box fully inside preferred → always allow (more specific)
+            #   2. Absolute size: area ≤ 25 000 px² AND h ≤ 80 px → looks like a real button
+            #   3. Relative area: planner box ≤ 25% of preferred AND h ≤ 80 px
+            if action == "click_box" and target:
+                planner_box = (target or {}).get("box")
+                if isinstance(planner_box, list) and len(planner_box) == 4:
+                    px1, py1, px2, py2 = [int(v) for v in planner_box]
+                    p_w    = max(1, px2 - px1)
+                    p_h    = max(1, py2 - py1)
+                    p_area = p_w * p_h
+                    pref_box = (preferred_target or {}).get("box") if preferred_target else None
+                    if isinstance(pref_box, list) and len(pref_box) == 4:
+                        rx1, ry1, rx2, ry2 = [int(v) for v in pref_box]
+                        ref_area = max(1, (rx2 - rx1) * (ry2 - ry1))
+                        # Check 1: containment (planner inside preferred → allow)
+                        contained = (px1 >= rx1 and py1 >= ry1 and px2 <= rx2 and py2 <= ry2)
+                    else:
+                        ref_area  = float("inf")
+                        contained = False
+                        rx1 = ry1 = rx2 = ry2 = 0
+                    # Check 2: absolute button size
+                    abs_button = p_area <= 25_000 and p_h <= 80
+                    # Check 3: relative area ratio
+                    rel_small  = p_area <= ref_area * 0.25 and p_h < 80
+                    if contained or abs_button or rel_small:
+                        return allow("planner_chose_more_precise_target_than_cta_override")
+
+            # Override to the preferred (button-shaped) resolve target while attempts remain.
             if preferred_target and counts.get("click_visible_resolve_target", 0) < 2:
                 return override(
                     "click_box",
                     {"box": [int(v) for v in preferred_target.get("box", [0, 0, 0, 0])]},
-                    "prefer_large_session_restore_cta_over_chrome_target",
+                    "prefer_session_restore_cta_button",
                     "click_visible_resolve_target",
                 )
+
+            # FIX C: After click attempts are exhausted, escalate to keyboard before giving up.
+            # Key order is determined by OCR context (destructive vs safe dialog).
+            _kb_order = self._keyboard_escalation_key_order("browser_session_restore")
+            if counts.get("keyboard_confirm", 0) < 1:
+                return override(
+                    "key_seq", {"keys": [_kb_order[0]]},
+                    f"session_restore_keyboard_confirm_key_{_kb_order[0].lower()}_after_click_exhausted",
+                    "keyboard_confirm",
+                )
+            if counts.get("escape", 0) < 1:
+                return override(
+                    "key_seq", {"keys": [_kb_order[1]]},
+                    f"session_restore_keyboard_fallback_key_{_kb_order[1].lower()}",
+                    "escape",
+                )
+
+            # FIX I: Address-bar bypass — after all clicks and keyboard attempts are
+            # exhausted, try navigating away via Ctrl+L (focus URL bar) + Return.
+            # This sidesteps the restore UI entirely.  Sequence:
+            #   Step 1 (addressbar_bypass count=0): Ctrl+L to focus the address bar.
+            #   Step 2 (addressbar_bypass count=1): Return to navigate to the current
+            #           URL (whatever was already in the bar) or the planner will issue
+            #           an open_url in the next cycle.
+            if counts.get("addressbar_bypass", 0) == 0:
+                return override(
+                    "key_seq", {"keys": ["ctrl+l"]},
+                    "session_restore_addressbar_bypass_step1_focus",
+                    "addressbar_bypass",
+                )
+            if counts.get("addressbar_bypass", 0) == 1:
+                return override(
+                    "key_seq", {"keys": ["Return"]},
+                    "session_restore_addressbar_bypass_step2_navigate",
+                    "addressbar_bypass",
+                )
+
             if strategy == "open_url":
                 return allow("open_url_bypasses_session_restore_page")
+
             return block("session_restore_requires_large_page_resolve_target_or_open_url")
 
         if strategy == "click_visible_resolve_target":
@@ -1917,15 +3039,30 @@ document.addEventListener('keydown',function(e){{if(e.key==='Escape'){{lb.classL
 
         resolve_targets = blocker.get("resolve_targets") or []
         if resolve_targets and counts.get("click_visible_resolve_target", 0) < 2:
-            primary = resolve_targets[0]
+            # Use the button-preferring sort for the generic case too.
+            preferred = self._preferred_resolve_target(snapshot, blocker)
+            primary = preferred if preferred else resolve_targets[0]
             return override(
                 "click_box",
                 {"box": [int(v) for v in primary.get("box", [0, 0, 0, 0])]},
                 f"use_visible_{blocker_class}_resolve_target",
                 "click_visible_resolve_target",
             )
-        if blocker_class in ("browser_permission_prompt", "modal_dialog", "cookie_banner") and counts.get("escape", 0) < 1:
-            return override("key_seq", {"keys": ["Escape"]}, f"fallback_escape_for_{blocker_class}", "escape")
+        # FIX C (generic): keyboard escalation after click attempts exhausted.
+        # Key order respects whether the visible dialog text looks destructive.
+        _kb_order_g = self._keyboard_escalation_key_order(blocker_class)
+        if counts.get("keyboard_confirm", 0) < 1:
+            return override(
+                "key_seq", {"keys": [_kb_order_g[0]]},
+                f"keyboard_confirm_key_{_kb_order_g[0].lower()}_fallback_for_{blocker_class}",
+                "keyboard_confirm",
+            )
+        if counts.get("escape", 0) < 1:
+            return override(
+                "key_seq", {"keys": [_kb_order_g[1]]},
+                f"keyboard_key_{_kb_order_g[1].lower()}_fallback_for_{blocker_class}",
+                "escape",
+            )
         return block(f"{blocker_class}_blocks_requested_action_until_resolved")
 
     def _executor_guard_result(
@@ -1975,6 +3112,42 @@ document.addEventListener('keydown',function(e){{if(e.key==='Escape'){{lb.classL
         same_family = self._action_family(last.get("action", ""), last.get("parameters") or {}) == self._action_family(action, params)
         last_streak = int(last_result.get("same_action_same_state_streak") or 1)
         if same_state and same_family and last_streak > 1:
+            # FIX D: Before hard-failing, check whether keyboard dismissal has been tried
+            # for the current blocker.  If not, escalate proactively so the caller can
+            # act on the suggestion rather than just seeing a bare failure.
+            # Key order is determined by OCR context (destructive vs safe dialog).
+            current_blocker = self._primary_blocker(snapshot)
+            if current_blocker:
+                bsig  = str(current_blocker.get("signature", "") or "")
+                bclass = str(current_blocker.get("class", "") or "")
+                b_counts = self._attempt_counts(self._recent_blocker_attempts(bsig))
+                _kb_order_guard = self._keyboard_escalation_key_order(bclass)
+                if b_counts.get("keyboard_confirm", 0) < 1:
+                    _k0 = _kb_order_guard[0]
+                    return {
+                        "status": "failure",
+                        "error_code": "ANTI_REPEAT_GUARD_KEYBOARD_ESCALATION",
+                        "error_message": f"Anti-repeat guard: escalating to {_k0} to dismiss blocker",
+                        "event_applied": False,
+                        "recovery_hint": f"use_key_seq_{_k0}_to_dismiss_blocker",
+                        "suggested_action": "key_seq",
+                        "suggested_params": {"keys": [_k0]},
+                        "guard_reason": "same_family_repeated_escalating_to_keyboard",
+                        "blocker_class": bclass,
+                    }
+                if b_counts.get("escape", 0) < 1:
+                    _k1 = _kb_order_guard[1]
+                    return {
+                        "status": "failure",
+                        "error_code": "ANTI_REPEAT_GUARD_KEYBOARD_ESCALATION",
+                        "error_message": f"Anti-repeat guard: escalating to {_k1} to dismiss blocker",
+                        "event_applied": False,
+                        "recovery_hint": f"use_key_seq_{_k1}_to_dismiss_blocker",
+                        "suggested_action": "key_seq",
+                        "suggested_params": {"keys": [_k1]},
+                        "guard_reason": "same_family_repeated_escalating_to_escape",
+                        "blocker_class": bclass,
+                    }
             return {
                 "status": "failure",
                 "error_code": "ANTI_REPEAT_GUARD",
@@ -2613,9 +3786,27 @@ document.addEventListener('keydown',function(e){{if(e.key==='Escape'){{lb.classL
         self.last_ocr_lines = list(ocr_levels.get("lines") or [])
         self.last_ocr_source = str(ocr_levels.get("source") or "")
         self.last_ax_nodes = self._fetch_ax_nodes()
-        # Keep words for precise targeting and lines for multi-word targeting / planner context.
-        self.last_ocr_words = sorted(self.last_ocr_words, key=lambda w: (-(w["box"][3]-w["box"][1]), -float(w.get("conf", 100))))[:OCR_LIMIT]
-        self.last_ocr_lines = sorted(self.last_ocr_lines, key=lambda w: (-(w["box"][3]-w["box"][1]), -float(w.get("conf", 100))))[: max(40, min(OCR_LIMIT, 160))]
+        # Fix O: Separate caps per OCR level.
+        # - Words: sorted by confidence first (highest conf = best word detection),
+        #   then by box height to keep taller glyphs. Hard cap raised to 2000 to
+        #   prevent dropping real word boxes and forcing synthetic fallback.
+        # - Lines: sorted by height desc (large regions first), capped at a smaller
+        #   limit since there are naturally fewer line-level items.
+        _word_cap = max(OCR_LIMIT, 2000)
+        _line_cap = max(40, min(OCR_LIMIT, 160))
+        # Stamp raw_word origin on word items that have no origin yet
+        for _w in self.last_ocr_words:
+            _w.setdefault("_origin", "raw_word")
+        for _l in self.last_ocr_lines:
+            _l.setdefault("_origin", "line_item")
+        self.last_ocr_words = sorted(
+            self.last_ocr_words,
+            key=lambda w: (-float(w.get("conf", 100)), -(w["box"][3] - w["box"][1])),
+        )[:_word_cap]
+        self.last_ocr_lines = sorted(
+            self.last_ocr_lines,
+            key=lambda w: (-(w["box"][3] - w["box"][1]), -float(w.get("conf", 100))),
+        )[:_line_cap]
         self.last_ocr = self.last_ocr_words
         self._log(
             "debug",
@@ -2657,7 +3848,9 @@ document.addEventListener('keydown',function(e){{if(e.key==='Escape'){{lb.classL
                 prefer_bold=prefer_bold
             )
             if w:
-                ocr_box = list(w["box"])
+                ocr_box = list(w.get("_original_box") or w["box"])
+                subbox_applied = bool(w.get("_subbox_applied", False))
+                w_origin = str(w.get("_origin", "") or "")
                 w = self._maybe_refine_click_target("click_any_text", {"patterns": patterns, "nth": nth, "prefer_bold": prefer_bold}, snapshot, blocker, w) or w
                 x1,y1,x2,y2 = w["box"]; cx,cy = (x1+x2)//2, (y1+y2)//2
                 vis_paths = self._save_click_visual_debug(
@@ -2665,12 +3858,16 @@ document.addEventListener('keydown',function(e){{if(e.key==='Escape'){{lb.classL
                     final_box=[int(x1), int(y1), int(x2), int(y2)],
                     click_rel=(int(cx), int(cy)),
                     action="click_any_text",
+                    subbox_applied=subbox_applied,
+                    parent_box=w.get("_parent_box"),
+                    origin=w_origin,
+                    candidates_debug=self._last_resolve_candidates,
                 )
                 self._debug_save_click_crop(
                     box=[int(x1), int(y1), int(x2), int(y2)],
                     click_rel=(int(cx), int(cy)),
                     action="click_any_text",
-                    note=f"pattern_used={pat} level={w.get('level', 'word')}",
+                    note=f"pattern_used={pat} level={w.get('level', 'word')} subbox={subbox_applied}",
                 )
                 x_abs,y_abs = self.grabber.to_abs(cx,cy)
                 if not CLICK_ENABLED or not self._xdotool_ok:
@@ -2685,9 +3882,13 @@ document.addEventListener('keydown',function(e){{if(e.key==='Escape'){{lb.classL
                     "pattern_used": pat,
                     "ocr_level": w.get("level", "word"),
                     "targeting_source": f"ocr_{w.get('level', 'word')}",
+                    "box_origin": w_origin,
+                    "subbox_applied": subbox_applied,
                     "click_abs": [x_abs, y_abs],
+                    "hierarchy_overlay_path": vis_paths.get("hierarchy_path", ""),
                     "ocr_box_overlay_path": vis_paths.get("ocr_box_path", ""),
                     "click_target_overlay_path": vis_paths.get("click_target_path", ""),
+                    "level_overlay_paths": vis_paths.get("level_paths") or [],
                 }
         return {"status":"failure","error_code":"ELEMENT_NOT_FOUND","error_message": f"No pattern matched: {patterns}"}
 
@@ -2699,17 +3900,22 @@ document.addEventListener('keydown',function(e){{if(e.key==='Escape'){{lb.classL
         if not w:
             return {"status":"failure","error_code":"ANCHOR_NOT_FOUND","error_message": anchor_regex}
         ocr_box = list(w["box"])
+        w_origin = str(w.get("_origin", "") or "")
         w = self._maybe_refine_click_target("click_near_text", {"anchor_regex": anchor_regex, "dx": dx, "dy": dy}, snapshot, blocker, w) or w
         x1,y1,x2,y2 = w["box"]; cx,cy = (x1+x2)//2, (y1+y2)//2
         # Guard against header/account anchors (e.g., email in header)
         if "@" in w.get("text", "") and cy < 80:
             return {"status":"failure","error_code":"ANCHOR_REJECTED_HEADER","error_message": w.get("text", "")}
         click_x, click_y = int(cx + dx), int(cy + dy)
+        click_final_box = [click_x - 12, click_y - 12, click_x + 12, click_y + 12]
         vis_paths = self._save_click_visual_debug(
             ocr_box=ocr_box,
-            final_box=[click_x - 12, click_y - 12, click_x + 12, click_y + 12],
+            final_box=click_final_box,
             click_rel=(click_x, click_y),
             action="click_near_text",
+            parent_box=w.get("_parent_box"),
+            origin=w_origin,
+            candidates_debug=self._last_resolve_candidates,
         )
         # For near-text clicks, define a small box around the click point for cropping.
         self._debug_save_click_crop(
@@ -2731,9 +3937,12 @@ document.addEventListener('keydown',function(e){{if(e.key==='Escape'){{lb.classL
             "offset": [dx, dy],
             "anchor_level": w.get("level", "word"),
             "targeting_source": f"ocr_{w.get('level', 'word')}",
+            "box_origin": w_origin,
             "click_abs": [x_abs, y_abs],
+            "hierarchy_overlay_path": vis_paths.get("hierarchy_path", ""),
             "ocr_box_overlay_path": vis_paths.get("ocr_box_path", ""),
             "click_target_overlay_path": vis_paths.get("click_target_path", ""),
+            "level_overlay_paths": vis_paths.get("level_paths") or [],
         }
 
     def _action_click_box(self, box):
@@ -2745,6 +3954,73 @@ document.addEventListener('keydown',function(e){{if(e.key==='Escape'){{lb.classL
         if x2 <= x1 or y2 <= y1:
             return {"status": "failure", "error_code": "BAD_BOX", "error_message": str(box)}
         cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+
+        # FIX E (refined): Bottom-band bias for large dialog boxes under an active blocker.
+        #
+        # The bias is SKIPPED when:
+        #   1. The box is small / button-sized → likely already targeting the right element.
+        #   2. A preferred button target from Fix A is available with a small bbox → click
+        #      that instead (the caller — _blocker_policy_directive — should have already done
+        #      this, but guard here as a belt-and-suspenders check).
+        #
+        # When bias IS applied:
+        #   • cy is set to the footer band [0.70h, 0.92h] within the box.
+        #   • cx is biased toward the right half of the box (where most UI buttons live
+        #     in LTR layouts) but kept within [x1+32, x2-32].
+        #   • The bias only fires if OCR confirms a button-like word is in the lower third
+        #     of the image, OR if the box is so large it clearly spans the entire dialog.
+        bottom_biased = False
+        bottom_bias_reason = ""
+        bw = x2 - x1
+        bh = y2 - y1
+        _is_large_dialog_body = bw > 400 and bh > 120
+        if _is_large_dialog_body and self.last_img is not None:
+            snap = self._state_snapshot()
+            active_blocker = self._primary_blocker(snap)
+            if active_blocker:
+                img_h = int(self.last_img.shape[0])
+                # Check 1: do we already have a precise button bbox from the blocker?
+                preferred_tgt = self._preferred_resolve_target(snap, active_blocker)
+                p_box = (preferred_tgt or {}).get("box")
+                if isinstance(p_box, list) and len(p_box) == 4:
+                    p_bh = max(1, int(p_box[3]) - int(p_box[1]))
+                    p_bw = max(1, int(p_box[2]) - int(p_box[0]))
+                    if p_bh < 60 and p_bw < 500:
+                        # A precise button target is known; skip the bias entirely
+                        _is_large_dialog_body = False
+
+                if _is_large_dialog_body:
+                    # Check 2: confirm a dismiss word is visible in the lower 35% of the image
+                    _footer_ocr_hit = False
+                    footer_y_threshold = img_h * 0.65
+                    for w in (self.last_ocr_words or self.last_ocr or []):
+                        w_box = w.get("box") or []
+                        if len(w_box) >= 4:
+                            w_cy = (int(w_box[1]) + int(w_box[3])) / 2.0
+                            if w_cy >= footer_y_threshold and self._BUTTON_PARTIAL_RE.search(str(w.get("text", ""))):
+                                _footer_ocr_hit = True
+                                break
+                    # Also fire if the box is extremely large (spans > 60% of screen height)
+                    _very_large = bh > img_h * 0.45
+                    if _footer_ocr_hit or _very_large:
+                        # Apply footer-band bias: cy in [70%, 92%] of bh
+                        cy = y1 + int(bh * 0.80)
+                        cy = max(y1 + int(bh * 0.70), min(cy, y1 + int(bh * 0.92)))
+                        cy = max(y1 + 4, min(cy, y2 - 4))
+                        # Bias cx toward right side (most LTR button rows are right-aligned)
+                        cx_right_bias = x1 + int(bw * 0.70)
+                        cx = max(x1 + 32, min(cx_right_bias, x2 - 32))
+                        bottom_biased = True
+                        bottom_bias_reason = "footer_ocr_hit" if _footer_ocr_hit else "very_large_box"
+
+        box_action_tag = "click_box_biased" if bottom_biased else "click_box"
+        vis_paths = self._save_click_visual_debug(
+            ocr_box=[x1, y1, x2, y2],
+            final_box=[x1, y1, x2, y2],
+            click_rel=(int(cx), int(cy)),
+            action=box_action_tag,
+            candidates_debug=self._last_resolve_candidates,
+        )
         self._debug_save_click_crop(
             box=[x1, y1, x2, y2],
             click_rel=(int(cx), int(cy)),
@@ -2755,7 +4031,17 @@ document.addEventListener('keydown',function(e){{if(e.key==='Escape'){{lb.classL
             return {"status": "failure", "error_code": "CLICK_DISABLED_OR_MISSING_XDOTOOL"}
         _safe_run(["xdotool", "mousemove", "--sync", str(x_abs), str(y_abs)])
         _safe_run(["xdotool", "click", "1"])
-        return {"status": "success", "box": [x1, y1, x2, y2], "clicked_abs": [x_abs, y_abs]}
+        return {
+            "status": "success",
+            "box": [x1, y1, x2, y2],
+            "clicked_abs": [x_abs, y_abs],
+            "bottom_biased": bottom_biased,
+            "bottom_bias_reason": bottom_bias_reason,
+            "hierarchy_overlay_path": vis_paths.get("hierarchy_path", ""),
+            "ocr_box_overlay_path": vis_paths.get("ocr_box_path", ""),
+            "click_target_overlay_path": vis_paths.get("click_target_path", ""),
+            "level_overlay_paths": vis_paths.get("level_paths") or [],
+        }
 
     def _action_sleep(self, seconds: float = 0.8):
         time.sleep(float(seconds))
@@ -2777,27 +4063,116 @@ document.addEventListener('keydown',function(e){{if(e.key==='Escape'){{lb.classL
         if not w:
             return {"status": "failure", "error_code": "ELEMENT_NOT_FOUND",
                     "error_message": f"Regex '{regex}' not found"}
-        ocr_box = list(w["box"])   # capture raw OCR match before any refinement
-        w = self._maybe_refine_click_target(
-            "click_text",
-            {"regex": regex, "nth": nth, "prefer_bold": prefer_bold, "fuzzy_text": fuzzy_text, "fuzzy_threshold": fuzzy_threshold},
-            snapshot,
-            blocker,
-            w,
-        ) or w
+        ocr_box = list(w.get("_original_box") or w["box"])  # original pre-subbox box for visual
+        subbox_applied = bool(w.get("_subbox_applied", False))
+        origin_before_refine = str(w.get("_origin", "") or "")
+        refine_params = {"regex": regex, "nth": nth, "prefer_bold": prefer_bold,
+                         "fuzzy_text": fuzzy_text, "fuzzy_threshold": fuzzy_threshold}
+        # Fix M: if origin is synthetic, _maybe_refine_click_target will attempt a real
+        # OCR pass on the parent line box. If it returns None the target is still synthetic
+        # and we need VLM (handled below).
+        refined_w = self._maybe_refine_click_target("click_text", refine_params, snapshot, blocker, w)
+        synthetic_refine_failed = (
+            origin_before_refine in BOX_ORIGINS_SYNTHETIC
+            and (refined_w is None or str(refined_w.get("_origin", "") or "") in BOX_ORIGINS_SYNTHETIC)
+        )
+        w = refined_w or w
         x1,y1,x2,y2 = w["box"]; cx,cy = (x1+x2)//2, (y1+y2)//2
-        # Full-frame annotated images: OCR box + final click target
+
+        # Fix J + Fix L/M: VLM fallback when:
+        #   • the chosen box is geometrically ambiguous, OR
+        #   • the same blocker has failed ≥ 2 times, OR
+        #   • Fix M refinement failed (origin is still synthetic)
+        targeting_source = f"ocr_{w.get('level', 'word')}"
+        vlm_used = False
+        if LLM_API_URL:
+            blocker_failure_count = 0
+            if blocker:
+                bsig = str(blocker.get("signature", "") or "")
+                b_counts = self._attempt_counts(self._recent_blocker_attempts(bsig))
+                blocker_failure_count = b_counts.get("click_visible_resolve_target", 0)
+            should_try_vlm = (
+                synthetic_refine_failed
+                or self._box_is_ambiguous(w["box"], w.get("text", ""))
+                or blocker_failure_count >= 2
+            )
+            if should_try_vlm:
+                label = w.get("text", "") or str(regex or fuzzy_text or "")
+                ctx_hint = f"blocker={blocker.get('class', '')}" if blocker else ""
+                vlm_box = self._vlm_locate_box(label, ctx_hint)
+                if vlm_box:
+                    vlm_bw = max(1, vlm_box[2] - vlm_box[0])
+                    vlm_bh = max(1, vlm_box[3] - vlm_box[1])
+                    # Use VLM result if it's tighter than current box (or if refine failed)
+                    cur_area = (x2 - x1) * (y2 - y1)
+                    vlm_area = vlm_bw * vlm_bh
+                    if vlm_area < cur_area * 0.9 or synthetic_refine_failed:
+                        x1, y1, x2, y2 = vlm_box
+                        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+                        vlm_used = True
+                        targeting_source = "vlm_locate"
+                        self._log("info", "click_text.vlm_fallback_used", {
+                            "original_box": w["box"], "vlm_box": vlm_box,
+                            "origin_before": origin_before_refine,
+                            "synthetic_refine_failed": synthetic_refine_failed,
+                            "regex": regex, "label": label,
+                        })
+
+        # Fix N: Pre-click validation gate — confirm the desired text is in the crop.
+        # Skip for VLM-derived boxes (they already went through visual confirmation)
+        # and for boxes from a11y (trusted).
+        desired_text = w.get("text", "") or str(regex or fuzzy_text or "")
+        w_origin = str(w.get("_origin", "") or "")
+        if not vlm_used and w_origin not in ("a11y", "vlm"):
+            valid = self._validate_click_box([x1, y1, x2, y2], desired_text)
+            if not valid:
+                self._log("warn", "click_text.validation_failed", {
+                    "box": [x1, y1, x2, y2], "desired": desired_text,
+                    "origin": w_origin, "level": w.get("level", ""),
+                })
+                # Escalate to VLM if available; otherwise return failure so planner can re-plan
+                if LLM_API_URL:
+                    label = desired_text
+                    ctx_hint = f"blocker={blocker.get('class', '')}" if blocker else ""
+                    vlm_box = self._vlm_locate_box(label, ctx_hint)
+                    if vlm_box:
+                        x1, y1, x2, y2 = vlm_box
+                        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+                        vlm_used = True
+                        targeting_source = "vlm_locate_validation_escalation"
+                    else:
+                        return {
+                            "status": "failure",
+                            "error_code": "VALIDATION_FAILED",
+                            "error_message": f"Text '{desired_text}' not found in crop around box {[x1,y1,x2,y2]}",
+                            "box": [x1, y1, x2, y2],
+                            "origin": w_origin,
+                        }
+                else:
+                    return {
+                        "status": "failure",
+                        "error_code": "VALIDATION_FAILED",
+                        "error_message": f"Text '{desired_text}' not found in crop around box {[x1,y1,x2,y2]}",
+                        "box": [x1, y1, x2, y2],
+                        "origin": w_origin,
+                    }
+
+        action_tag = "click_text_vlm" if vlm_used else "click_text"
         vis_paths = self._save_click_visual_debug(
             ocr_box=ocr_box,
             final_box=[int(x1), int(y1), int(x2), int(y2)],
             click_rel=(int(cx), int(cy)),
-            action="click_text",
+            action=action_tag,
+            subbox_applied=subbox_applied,
+            parent_box=w.get("_parent_box"),
+            origin=w_origin,
+            candidates_debug=self._last_resolve_candidates,
         )
         self._debug_save_click_crop(
             box=[int(x1), int(y1), int(x2), int(y2)],
             click_rel=(int(cx), int(cy)),
             action="click_text",
-            note=f"level={w.get('level', 'word')}",
+            note=f"level={w.get('level', 'word')} subbox={subbox_applied} vlm={vlm_used}",
         )
         x_abs,y_abs = self.grabber.to_abs(cx,cy)
         if not CLICK_ENABLED or not self._xdotool_ok:
@@ -2808,13 +4183,19 @@ document.addEventListener('keydown',function(e){{if(e.key==='Escape'){{lb.classL
         return {
             "status": "success",
             "clicked": w["text"],
-            "box": w["box"],
+            "box": [int(x1), int(y1), int(x2), int(y2)],
             "ocr_box": ocr_box,
             "ocr_level": w.get("level", "word"),
-            "targeting_source": f"ocr_{w.get('level', 'word')}",
+            "targeting_source": targeting_source,
+            "box_origin": w_origin,
+            "subbox_applied": subbox_applied,
+            "synthetic_refine_failed": synthetic_refine_failed,
+            "vlm_used": vlm_used,
             "click_abs": [x_abs, y_abs],
+            "hierarchy_overlay_path": vis_paths.get("hierarchy_path", ""),
             "ocr_box_overlay_path": vis_paths.get("ocr_box_path", ""),
             "click_target_overlay_path": vis_paths.get("click_target_path", ""),
+            "level_overlay_paths": vis_paths.get("level_paths") or [],
         }
 
     def _action_type_text(self, text: str, confidential: bool = False):
@@ -3124,6 +4505,85 @@ document.addEventListener('keydown',function(e){{if(e.key==='Escape'){{lb.classL
 
                 guard_result = self._executor_guard_result(op, params, pre_action_snapshot)
                 if guard_result is not None:
+                    # FIX D: If the guard suggests a keyboard action, execute it directly
+                    # instead of surfacing the failure to the planner — up to the hard cap.
+                    suggested_action = guard_result.get("suggested_action")
+                    suggested_params = guard_result.get("suggested_params") or {}
+                    _is_kb_escalation = (
+                        suggested_action is not None
+                        and guard_result.get("error_code") == "ANTI_REPEAT_GUARD_KEYBOARD_ESCALATION"
+                    )
+                    if _is_kb_escalation:
+                        # Use OCR-context key ordering regardless of what _executor_guard_result chose
+                        _blocker_for_key_order = self._primary_blocker(pre_action_snapshot) or {}
+                        _bclass_for_ko = str((_blocker_for_key_order.get("class") if isinstance(_blocker_for_key_order, dict) else "") or "")
+                        _kb_order_d = self._keyboard_escalation_key_order(_bclass_for_ko)
+                        _bsig_d = str(
+                            (_blocker_for_key_order.get("signature") if isinstance(_blocker_for_key_order, dict) else "")
+                            or "unknown"
+                        )
+                        _escalation_count = self._guard_kb_escalations.get(_bsig_d, 0)
+                        if _escalation_count >= self._GUARD_KB_ESCALATION_CAP:
+                            # Cap reached: surface to planner so it can change strategy
+                            _is_kb_escalation = False
+                            self._log("warn", "guard.keyboard_escalation.cap_reached", {
+                                "blocker_sig": _bsig_d,
+                                "cap": self._GUARD_KB_ESCALATION_CAP,
+                                "count": _escalation_count,
+                                "surfacing_to_planner": True,
+                            })
+                        else:
+                            # Pick the correct key based on context-aware order
+                            _chosen_key = _kb_order_d[_escalation_count % len(_kb_order_d)]
+                            suggested_params = {"keys": [_chosen_key]}
+                            self._guard_kb_escalations[_bsig_d] = _escalation_count + 1
+                    if _is_kb_escalation:
+                        self._log("info", "guard.keyboard_escalation", {
+                            "original_action": op,
+                            "escalating_to": suggested_action,
+                            "keys": suggested_params.get("keys"),
+                            "reason": guard_result.get("guard_reason"),
+                            "escalation_n": self._guard_kb_escalations.get(_bsig_d, 1),
+                            "cap": self._GUARD_KB_ESCALATION_CAP,
+                        })
+                        escalated_params = self._canonicalize_params(suggested_action, suggested_params)
+                        escalated_result = self._action_key_seq(**escalated_params) if suggested_action == "key_seq" else None
+                        if escalated_result is not None:
+                            escalated_result = self._finalize_action_result(
+                                suggested_action, escalated_params, escalated_result, pre_action_snapshot
+                            )
+                            escalated_result["planner_requested_action"] = planner_op
+                            escalated_result["planner_requested_parameters"] = planner_params
+                            escalated_result["executed_action"] = suggested_action
+                            escalated_result["executed_parameters"] = escalated_params
+                            escalated_result["executor_override_reason"] = guard_result.get("guard_reason", "anti_repeat_keyboard_escalation")
+                            escalated_result["recovery_strategy"] = "keyboard_confirm"
+                            result = escalated_result
+                            self.history.append({"action": suggested_action, "parameters": escalated_params, "result": result})
+                            self._log("info", "action.result", {"action": suggested_action, "result": result})
+                            post_frame_path = self._save_trace_frame(suggested_action, "post")
+                            self._trace_append({
+                                "idx": self.trace_idx,
+                                "ts": now_utc_iso(),
+                                "decision": {"action": planner_op, "parameters": planner_params, "reasoning": reasoning, "completed": completed},
+                                "result": result,
+                                "frame_path": frame_path,
+                                "post_frame_path": post_frame_path,
+                                "crop_overlay_path": "",
+                                "hierarchy_overlay_path": result.get("hierarchy_overlay_path") or "",
+                                "ocr_box_overlay_path": "",
+                                "click_target_overlay_path": "",
+                                "level_overlay_paths": result.get("level_overlay_paths") or [],
+                                "ocr_results_n": len(ocr_min),
+                                "ocr_line_results_n": len(self.last_ocr_lines),
+                                "ocr_word_results_n": len(self.last_ocr_words),
+                                "ui_elements_n": len(ui_elements),
+                                "screenshot_b64_len": len(screenshot_b64) if screenshot_b64 else 0,
+                            })
+                            self._trace_render_html()
+                            step += 1
+                            time.sleep(0.8)
+                            continue
                     result = self._finalize_action_result(op, params, guard_result, pre_action_snapshot)
                 else:
                     # Intercept brittle planner steps with a consensus step first
@@ -3171,8 +4631,10 @@ document.addEventListener('keydown',function(e){{if(e.key==='Escape'){{lb.classL
                                     "frame_path": frame_path,
                                     "post_frame_path": post_frame_path,
                                     "crop_overlay_path": crop_overlay,
+                                    "hierarchy_overlay_path": result.get("hierarchy_overlay_path") or "",
                                     "ocr_box_overlay_path": result.get("ocr_box_overlay_path") or "",
                                     "click_target_overlay_path": result.get("click_target_overlay_path") or "",
+                                    "level_overlay_paths": result.get("level_overlay_paths") or [],
                                     "ocr_results_n": len(ocr_min),
                                     "ocr_line_results_n": len(self.last_ocr_lines),
                                     "ocr_word_results_n": len(self.last_ocr_words),
@@ -3246,8 +4708,10 @@ document.addEventListener('keydown',function(e){{if(e.key==='Escape'){{lb.classL
                     "frame_path": frame_path,
                     "post_frame_path": post_frame_path,
                     "crop_overlay_path": crop_overlay,
+                    "hierarchy_overlay_path": result.get("hierarchy_overlay_path") or "",
                     "ocr_box_overlay_path": result.get("ocr_box_overlay_path") or "",
                     "click_target_overlay_path": result.get("click_target_overlay_path") or "",
+                    "level_overlay_paths": result.get("level_overlay_paths") or [],
                     "ocr_results_n": len(ocr_min),
                     "ocr_line_results_n": len(self.last_ocr_lines),
                     "ocr_word_results_n": len(self.last_ocr_words),
