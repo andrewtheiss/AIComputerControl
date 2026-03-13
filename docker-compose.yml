@@ -216,7 +216,7 @@ services:
       TASK_PLANNER_URL: http://task-planner:8000/v1/actions/next
       PLANNER_API_KEY: taskPlannerApiSecret
       TARGET_ENSEMBLE_API_URL: http://target-ensemble-api:8000/infer
-      TARGET_ENSEMBLE_SHADOW_MODE: "0"
+      TARGET_ENSEMBLE_SHADOW_MODE: "1"
       TARGET_ENSEMBLE_SHADOW_DEBUG: "1"
       # Explicitly set Firefox binary and profile (adjust profile dir name if different)
       FIREFOX_BIN: "/usr/bin/firefox-esr"
@@ -253,7 +253,7 @@ services:
       TASK_PLANNER_URL: http://task-planner:8000/v1/actions/next
       PLANNER_API_KEY: taskPlannerApiSecret
       TARGET_ENSEMBLE_API_URL: http://target-ensemble-api:8000/infer
-      TARGET_ENSEMBLE_SHADOW_MODE: "0"
+      TARGET_ENSEMBLE_SHADOW_MODE: "1"
       TARGET_ENSEMBLE_SHADOW_DEBUG: "1"
       FIREFOX_BIN: "/usr/bin/firefox-esr"
       FIREFOX_PROFILE_PATH: "/root/.mozilla/firefox/agent2.default-esr"

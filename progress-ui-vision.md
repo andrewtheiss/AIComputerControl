@@ -9,8 +9,9 @@ The new UI vision work is partially scaffolded and partially verified.
 - The new mock model containers are real enough to boot, answer `/health`, and return structured mock predictions over HTTP.
 - The replay/harness utility works for pure data-path tests.
 - The service verification tests were replaced with container-backed integration tests and now pass cleanly in the local WSL environment.
-- The real `ocr-api` and `ocr-ensemble-api` were not fully re-verified in this audit because `ocr-api` is the main GPU/runtime risk surface and `ocr-ensemble-api` currently depends on it.
-- The agent-side integration is still shadow-only and disabled in compose.
+- The real `ocr-api` and `ocr-ensemble-api` have now been re-verified with a readiness wait and a live-image OCR probe.
+- The agent-side integration is still shadow-only, but shadow mode is now enabled in compose.
+- A one-command verifier now exists at `tools/verify_ui_vision_stack.py`.
 
 ## What Was Verified Today
 
@@ -25,6 +26,8 @@ These services were started and checked successfully:
 - `aria-ui-api`
 - `phi-ground-api`
 - `target-ensemble-api`
+- `ocr-api`
+- `ocr-ensemble-api`
 
 Observed results:
 
@@ -43,6 +46,20 @@ Specific verified responses:
   - action `click`
   - score `0.71947`
   - per-model votes from `groundnext`, `aria-ui`, and `phi-ground`
+- `ocr-api` stayed up long enough to finish model downloads and answered internal health with `{"status":"ok","backend":"ppocr"}`
+- `ocr-ensemble-api /health` returned `{"status":"ok","model_id":"ocr-ensemble","models":["ppocr","omniparser","paddleocr-vl","surya"]}`
+
+### Verified by live OCR path checks
+
+- `ocr-api` accepted a live `POST /ocr` request from `ocr-ensemble-api`
+- after readiness, `ocr-ensemble-api` returned live `ppocr` output on `texty_image.png`
+- the `ppocr` per-model payload contained non-empty `words` and `lines`
+
+Important nuance:
+
+- if `ocr-ensemble-api` is queried immediately after bringing the stack up, `ppocr` may appear as `error`
+- after `ocr-api` is actually ready, the same request succeeds
+- this is currently a readiness race, not evidence of a hard crash
 
 ### Verified by checked-in debug artifacts
 
@@ -57,6 +74,7 @@ These tests now pass:
 - `tests.test_ocr_ensemble`
 - `tests.test_target_ensemble`
 - `tests.test_ui_vision_harness`
+- `tools/verify_ui_vision_stack.py` also completes successfully
 
 Verified command:
 
@@ -66,7 +84,7 @@ wsl bash -lc 'cd /home/theiss/AIComputerControl && .venv-ui-vision/bin/python -m
 
 Observed result:
 
-- `Ran 7 tests in 16.965s`
+- `Ran 8 tests`
 - `OK`
 
 This means the current automated verification path covers:
@@ -74,6 +92,7 @@ This means the current automated verification path covers:
 - mock model-service container boot plus selftest
 - mock OCR ensemble container boot plus selftest
 - mock target ensemble container boot plus selftest
+- candidate graph building and merge behavior
 - candidate building
 - action inference
 - instruction derivation
@@ -123,7 +142,20 @@ Checked artifact evidence shows:
 
 This is not a segfault, but it is an important verification failure mode.
 
-### 3. Container exit code `255` after restart is not enough evidence of an app crash
+### 3. `ocr-ensemble` can show transient `ppocr` errors if queried before `ocr-api` is ready
+
+Observed behavior:
+
+- immediate post-start ensemble request can report:
+  - `ppocr: "error"`
+  - `ppocr_word_count: 0`
+- after waiting for `ocr-api` readiness, the same flow returns real `ppocr` OCR words and lines
+
+Current conclusion:
+
+- ensemble verification should include a readiness wait for `ocr-api`
+
+### 4. Container exit code `255` after restart is not enough evidence of an app crash
 
 The recently exited containers all share the same shutdown time window around the machine restart.
 
@@ -152,17 +184,20 @@ Likely interpretation:
 - created a generic `modelService` wrapper for OCR and grounding model endpoints
 - created `ocrEnsemble` service
 - created `targetEnsemble` service
+- created a reusable candidate graph builder
 - created shared schemas and debug helpers in `ui_vision_common`
 - added `tools/ui_vision_harness.py` for replay/export workflows
+- added `tools/verify_ui_vision_stack.py` for one-command verification
 - added agent-side shadow plumbing for target ensemble
 - added compose definitions for the new services
 
 ### Partially done
 
-- OCR ensemble fan-out and merge exists, but only as merged OCR words/lines
+- OCR ensemble fan-out and merge exists and is now verified with live `ppocr`, but it still returns merged OCR words/lines rather than a full interactable graph
 - target ensemble weighting exists, but only as a simple weighted ranker
+- candidate graph building exists and is wired into the harness and agent shadow candidate generation, but it is not yet a standalone service
 - debug output exists, but not yet at the full artifact granularity originally requested
-- harness exists, but not yet as a full independent benchmark suite for every stage
+- harness exists and a one-command verifier exists, but there is not yet a full benchmark/eval suite for every stage
 
 ### Not done yet
 
@@ -173,7 +208,7 @@ Likely interpretation:
   - GroundNext-7B
   - Aria-UI
   - Phi-Ground
-- canonical candidate graph builder with OCR attachment to interactable boxes
+- standalone candidate graph service with independent `/health` and `/infer`-style verification
 - full gating and repair logic:
   - top-1 threshold
   - top-1 minus top-2 margin
@@ -181,9 +216,8 @@ Likely interpretation:
   - repair crop reruns
   - final validator stage
 - live agent integration for click execution
-- shadow mode enablement in compose
-- robust independent benchmark runs for the real `ocr-api`
-- real model verification for the live `ocr-api`
+- robust benchmark runs over larger real corpora
+- live agent integration for click execution beyond shadow mode
 
 ## Safe Verification Plan
 
@@ -345,6 +379,7 @@ Pass criteria:
 - container stays `Up`
 - health endpoint returns JSON
 - logs do not show repeated restarts or immediate native failure
+- model startup completes and `Uvicorn running on http://0.0.0.0:8020` appears in logs
 
 Stop here if:
 
@@ -377,10 +412,11 @@ Pass criteria:
 - `ocr-ensemble-api` stays up
 - health succeeds
 - logs do not show persistent `ocr-api` connection refused errors
+- a real-image request returns `ppocr` status `ok`
 
 Stop here if:
 
-- `ppocr` is still failing inside the ensemble
+- `ppocr` is still failing after `ocr-api` health is confirmed
 
 ### Step 7. Enable shadow mode only after Steps 1 through 6 are stable
 

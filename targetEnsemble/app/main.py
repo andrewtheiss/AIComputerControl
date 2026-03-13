@@ -36,13 +36,24 @@ def _load_json_env(name: str, default: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _candidate_prior(candidate: Dict[str, Any]) -> float:
+    extras = dict(candidate.get("extras") or {})
     score = float(candidate.get("score", 0.0))
+    interactable_score = float(extras.get("interactable_score", score) or score)
+    ocr_consensus = float(extras.get("ocr_consensus", min(1.0, score)) or 0.0)
+    action_compatibility = float(
+        extras.get(
+            "action_compatibility",
+            1.0 if "click" in (candidate.get("allowed_actions") or []) else 0.5,
+        )
+        or 0.0
+    )
     allowed_actions = candidate.get("allowed_actions") or []
     role = str(candidate.get("role", "") or "")
+    prior = 0.50 * interactable_score + 0.30 * ocr_consensus + 0.20 * action_compatibility
     bonus = 0.04 if "click" in allowed_actions else 0.0
     if role in ("button", "link", "textbox"):
         bonus += 0.03
-    return min(1.0, score + bonus)
+    return min(1.0, max(0.0, prior + bonus))
 
 
 def _call_model(session: requests.Session, model_id: str, model_url: str, payload: Dict[str, Any]) -> Dict[str, Any]:

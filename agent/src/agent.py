@@ -3377,22 +3377,135 @@ document.addEventListener('keydown',function(e){{
             return ["click"]
         return ["click"]
 
+    def _shadow_box_iou(self, a: List[int], b: List[int]) -> float:
+        try:
+            ax1, ay1, ax2, ay2 = [int(v) for v in a]
+            bx1, by1, bx2, by2 = [int(v) for v in b]
+        except Exception:
+            return 0.0
+        ix1 = max(ax1, bx1)
+        iy1 = max(ay1, by1)
+        ix2 = min(ax2, bx2)
+        iy2 = min(ay2, by2)
+        iw = max(0, ix2 - ix1)
+        ih = max(0, iy2 - iy1)
+        inter = iw * ih
+        if inter <= 0:
+            return 0.0
+        a_area = max(1, (ax2 - ax1) * (ay2 - ay1))
+        b_area = max(1, (bx2 - bx1) * (by2 - by1))
+        return inter / float(max(1, a_area + b_area - inter))
+
     def _build_target_ensemble_candidates(self, ui_elements: List[Dict[str, Any]], limit: int = 80) -> List[Dict[str, Any]]:
-        candidates: List[Dict[str, Any]] = []
-        for idx, element in enumerate(ui_elements[:limit], start=1):
+        viewport_w = int(self.last_img.shape[1]) if self.last_img is not None else 1000
+        viewport_h = int(self.last_img.shape[0]) if self.last_img is not None else 1000
+        groups: List[Dict[str, Any]] = []
+        for element in ui_elements[:limit]:
             box = element.get("box") or [0, 0, 0, 0]
             if not isinstance(box, list) or len(box) != 4:
                 continue
+            try:
+                norm_box = [int(v) for v in box]
+            except Exception:
+                continue
+            if norm_box[2] <= norm_box[0] or norm_box[3] <= norm_box[1]:
+                continue
+            text = str(element.get("text", "") or "")
+            text_key = " ".join(text.lower().split())
+            role = str(element.get("role", "") or "").lower()
+            source = str(element.get("source", "") or "")
+            allowed_actions = self._shadow_candidate_actions(element)
+            score = float(element.get("score", 0.0) or 0.0)
+            interactable_score = min(
+                1.0,
+                score
+                + (0.18 if (role in ("button", "link", "textbox", "input", "textarea") or source.lower() in ("ax", "det")) else 0.0)
+                + (0.04 if "click" in allowed_actions else 0.0),
+            )
+            node = {
+                "box": norm_box,
+                "text": text,
+                "text_key": text_key,
+                "role": role or None,
+                "source": source,
+                "score": score,
+                "allowed_actions": allowed_actions,
+                "interactable_score": interactable_score,
+            }
+            matched = None
+            for group in groups:
+                same_text = bool(text_key) and text_key == group["text_key"]
+                iou = self._shadow_box_iou(norm_box, group["box"])
+                if iou >= 0.65 or (same_text and iou >= 0.18) or ((not text_key or not group["text_key"]) and iou >= 0.45):
+                    matched = group
+                    break
+            if matched is None:
+                groups.append({"box": norm_box, "text_key": text_key, "nodes": [node]})
+                continue
+            matched["box"] = [
+                min(matched["box"][0], norm_box[0]),
+                min(matched["box"][1], norm_box[1]),
+                max(matched["box"][2], norm_box[2]),
+                max(matched["box"][3], norm_box[3]),
+            ]
+            if not matched["text_key"] and text_key:
+                matched["text_key"] = text_key
+            matched["nodes"].append(node)
+
+        candidates: List[Dict[str, Any]] = []
+        for idx, group in enumerate(
+            sorted(
+                groups,
+                key=lambda item: (
+                    max(node["interactable_score"] for node in item["nodes"]),
+                    max(node["score"] for node in item["nodes"]),
+                ),
+                reverse=True,
+            ),
+            start=1,
+        ):
+            nodes = group["nodes"]
+            box = [int(v) for v in group["box"]]
+            best_text_node = max(nodes, key=lambda node: (bool(node["text"].strip()), node["score"], len(node["text"])))
+            text_sources = {
+                str(node["source"]): {"text": str(node["text"]), "conf": round(float(node["score"]), 4)}
+                for node in nodes
+                if str(node["text"]).strip()
+            }
+            distinct_texts = {payload["text"].strip().lower() for payload in text_sources.values() if payload["text"].strip()}
+            ocr_consensus = 1.0 if len(distinct_texts) <= 1 and text_sources else (0.6 if distinct_texts else 0.0)
+            allowed_actions = sorted({action for node in nodes for action in node["allowed_actions"]})
+            center_x = int((box[0] + box[2]) / 2)
+            center_y = int((box[1] + box[3]) / 2)
+            role_hint = next((node["role"] for node in sorted(nodes, key=lambda item: (bool(item["role"]), item["interactable_score"]), reverse=True) if node["role"]), None)
+            primary_source = next((str(node["source"]) for node in nodes if str(node["source"]).lower() == "ax"), str(nodes[0]["source"]))
+            interactable_score = max(float(node["interactable_score"]) for node in nodes)
             candidates.append(
                 {
                     "id": f"C{idx:03d}",
-                    "box": [int(v) for v in box],
-                    "text": str(element.get("text", "") or ""),
-                    "score": float(element.get("score", 0.0) or 0.0),
-                    "role": element.get("role"),
-                    "source": element.get("source"),
-                    "allowed_actions": self._shadow_candidate_actions(element),
-                    "extras": {},
+                    "box": box,
+                    "text": str(best_text_node["text"] or ""),
+                    "score": interactable_score,
+                    "role": role_hint,
+                    "source": primary_source,
+                    "allowed_actions": allowed_actions,
+                    "extras": {
+                        "bbox_rel_1000": [
+                            int(round(box[0] * 1000.0 / max(1, viewport_w))),
+                            int(round(box[1] * 1000.0 / max(1, viewport_h))),
+                            int(round(box[2] * 1000.0 / max(1, viewport_w))),
+                            int(round(box[3] * 1000.0 / max(1, viewport_h))),
+                        ],
+                        "center_abs": [center_x, center_y],
+                        "text_sources": text_sources,
+                        "interactable_score": interactable_score,
+                        "ocr_consensus": ocr_consensus,
+                        "action_compatibility": 1.0 if "click" in allowed_actions else 0.5,
+                        "source_mask": sorted({str(node["source"]) for node in nodes if str(node["source"])}),
+                        "candidate_type": "interactable" if interactable_score >= 0.65 else "text_only",
+                        "source_count": len({str(node["source"]) for node in nodes if str(node["source"])}),
+                        "graph_version": "candidate_graph_v1",
+                    },
                 }
             )
         return candidates

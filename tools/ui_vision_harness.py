@@ -11,6 +11,12 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
+from ui_vision_common.candidate_graph import (
+    build_candidate_graph,
+    build_candidates as shared_build_candidates,
+    infer_allowed_actions as shared_infer_allowed_actions,
+)
+
 
 def load_json(path: Path) -> Dict[str, Any]:
     with path.open("r", encoding="utf-8") as fh:
@@ -39,39 +45,19 @@ def load_screenshot_b64(dump_path: Path, payload: Dict[str, Any]) -> str:
 
 
 def infer_allowed_actions(element: Dict[str, Any]) -> List[str]:
-    role = str(element.get("role", "") or "").lower()
-    text = str(element.get("text", "") or "").strip().lower()
-    source = str(element.get("source", "") or "").lower()
-    if role in {"textbox", "entry", "textarea", "input"}:
-        return ["click", "type", "focus"]
-    if role in {"button", "link", "menuitem", "tab"}:
-        return ["click", "hover"]
-    if source == "ax" and role:
-        return ["click", "focus"]
-    if text:
-        return ["click"]
-    return ["click"]
+    return shared_infer_allowed_actions(element)
 
 
 def build_candidates(ui_elements: Iterable[Dict[str, Any]], limit: int = 80) -> List[Dict[str, Any]]:
-    candidates: List[Dict[str, Any]] = []
-    for idx, element in enumerate(list(ui_elements)[:limit], start=1):
-        box = element.get("box") or [0, 0, 0, 0]
-        if not isinstance(box, list) or len(box) != 4:
-            continue
-        candidates.append(
-            {
-                "id": f"C{idx:03d}",
-                "box": [int(v) for v in box],
-                "text": str(element.get("text", "") or ""),
-                "score": float(element.get("score", 0.0) or 0.0),
-                "role": element.get("role"),
-                "source": element.get("source"),
-                "allowed_actions": infer_allowed_actions(element),
-                "extras": {},
-            }
-        )
-    return candidates
+    return shared_build_candidates(ui_elements, limit=limit)
+
+
+def build_candidate_graph_for_payload(payload: Dict[str, Any], candidate_limit: int = 80) -> List[Dict[str, Any]]:
+    viewport = None
+    screenshot_path = str(payload.get("screenshot_path", "") or "").strip()
+    if screenshot_path:
+        _ = screenshot_path
+    return build_candidate_graph(payload.get("ui_elements") or [], limit=candidate_limit, viewport=viewport)
 
 
 def derive_instruction(payload: Dict[str, Any]) -> str:
@@ -163,7 +149,8 @@ def replay_targets(dumps_dir: Path, endpoint: str, out_dir: Path, limit: int, ca
         if len(rows) >= limit:
             break
         shot = load_screenshot_b64(path, payload)
-        candidates = build_candidates(payload.get("ui_elements") or [], limit=candidate_limit)
+        candidate_graph = build_candidate_graph(payload.get("ui_elements") or [], limit=candidate_limit)
+        candidates = shared_build_candidates(payload.get("ui_elements") or [], limit=candidate_limit)
         if not shot or not candidates:
             continue
         request_payload = {
@@ -184,6 +171,7 @@ def replay_targets(dumps_dir: Path, endpoint: str, out_dir: Path, limit: int, ca
                     "latency_ms": int((time.perf_counter() - t0) * 1000),
                     "instruction": request_payload["instruction"],
                     "candidate_count": len(candidates),
+                    "candidate_graph_count": len(candidate_graph),
                     "final_candidate_id": final_pred.get("candidate_id"),
                     "final_score": final_pred.get("score"),
                 }
@@ -217,7 +205,7 @@ def export_corpus(dumps_dir: Path, out_dir: Path, limit: int, candidate_limit: i
                 "goal": payload.get("goal", ""),
                 "instruction": derive_instruction(payload),
                 "screenshot_path": str(screenshot_path),
-                "candidate_count": len(build_candidates(payload.get("ui_elements") or [], limit=candidate_limit)),
+                "candidate_count": len(shared_build_candidates(payload.get("ui_elements") or [], limit=candidate_limit)),
             }
         )
     write_jsonl(out_dir / "corpus.jsonl", rows)
