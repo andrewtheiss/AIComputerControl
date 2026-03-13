@@ -1,6 +1,6 @@
 # app/main.py
 import io, base64, cv2, numpy as np
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Request
 from .schemas import OCRRequest, OCRResponse, OCRBox
 from .engine_ppocr import PPOCREngine
 from .postproc import to_polys_words, group_lines
@@ -26,19 +26,30 @@ def _decode_to_bgr(data: bytes) -> np.ndarray:
 
 @app.post("/ocr", response_model=OCRResponse)
 async def ocr_endpoint(
+    request: Request,
     file: UploadFile = File(None),
     body: OCRRequest | None = None,
 ):
+    req = body
+    if req is None:
+        content_type = str(request.headers.get("content-type", "") or "").lower()
+        if "application/json" in content_type:
+            try:
+                raw_body = await request.json()
+            except Exception:
+                raw_body = None
+            if raw_body:
+                req = OCRRequest.model_validate(raw_body)
+
     # Accept either base64 JSON body or multipart file
-    if body and body.image_b64:
+    if req and req.image_b64:
         try:
-            data = base64.b64decode(body.image_b64, validate=True)
+            data = base64.b64decode(req.image_b64, validate=True)
         except Exception as e:
             raise HTTPException(400, f"Invalid base64: {e}")
-        req = body
     elif file is not None:
         data = await file.read()
-        req = OCRRequest() if body is None else body
+        req = OCRRequest() if req is None else req
     else:
         raise HTTPException(400, "Provide multipart file or image_b64")
 

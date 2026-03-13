@@ -23,6 +23,151 @@ services:
             - capabilities: [gpu]
     networks: ["ai-net"]
 
+  omniparser-api:
+    profiles: ["ui-vision"]
+    build:
+      context: .
+      dockerfile: modelService/Dockerfile
+    image: ai-ui-model-omniparser
+    environment:
+      MODEL_ID: omniparser
+      MODEL_ROLE: ocr
+      MODEL_BACKEND: mock
+      DEBUG_ARTIFACT_DIR: /tmp/ui-model-debug
+    ports:
+      - "28101:8000"
+    volumes:
+      - ./ui-model-debug:/tmp/ui-model-debug:rw
+    networks: ["ai-net"]
+
+  paddleocr-vl-api:
+    profiles: ["ui-vision"]
+    build:
+      context: .
+      dockerfile: modelService/Dockerfile
+    image: ai-ui-model-paddleocr-vl
+    environment:
+      MODEL_ID: paddleocr-vl
+      MODEL_ROLE: ocr
+      MODEL_BACKEND: mock
+      DEBUG_ARTIFACT_DIR: /tmp/ui-model-debug
+    ports:
+      - "28102:8000"
+    volumes:
+      - ./ui-model-debug:/tmp/ui-model-debug:rw
+    networks: ["ai-net"]
+
+  surya-api:
+    profiles: ["ui-vision"]
+    build:
+      context: .
+      dockerfile: modelService/Dockerfile
+    image: ai-ui-model-surya
+    environment:
+      MODEL_ID: surya
+      MODEL_ROLE: ocr
+      MODEL_BACKEND: mock
+      DEBUG_ARTIFACT_DIR: /tmp/ui-model-debug
+    ports:
+      - "28103:8000"
+    volumes:
+      - ./ui-model-debug:/tmp/ui-model-debug:rw
+    networks: ["ai-net"]
+
+  groundnext-api:
+    profiles: ["ui-vision"]
+    build:
+      context: .
+      dockerfile: modelService/Dockerfile
+    image: ai-ui-model-groundnext
+    environment:
+      MODEL_ID: groundnext
+      MODEL_ROLE: grounding
+      MODEL_BACKEND: mock
+      DEBUG_ARTIFACT_DIR: /tmp/ui-model-debug
+    ports:
+      - "28111:8000"
+    volumes:
+      - ./ui-model-debug:/tmp/ui-model-debug:rw
+    networks: ["ai-net"]
+
+  aria-ui-api:
+    profiles: ["ui-vision"]
+    build:
+      context: .
+      dockerfile: modelService/Dockerfile
+    image: ai-ui-model-aria-ui
+    environment:
+      MODEL_ID: aria-ui
+      MODEL_ROLE: grounding
+      MODEL_BACKEND: mock
+      DEBUG_ARTIFACT_DIR: /tmp/ui-model-debug
+    ports:
+      - "28112:8000"
+    volumes:
+      - ./ui-model-debug:/tmp/ui-model-debug:rw
+    networks: ["ai-net"]
+
+  phi-ground-api:
+    profiles: ["ui-vision"]
+    build:
+      context: .
+      dockerfile: modelService/Dockerfile
+    image: ai-ui-model-phi-ground
+    environment:
+      MODEL_ID: phi-ground
+      MODEL_ROLE: grounding
+      MODEL_BACKEND: mock
+      DEBUG_ARTIFACT_DIR: /tmp/ui-model-debug
+    ports:
+      - "28113:8000"
+    volumes:
+      - ./ui-model-debug:/tmp/ui-model-debug:rw
+    networks: ["ai-net"]
+
+  ocr-ensemble-api:
+    profiles: ["ui-vision"]
+    build:
+      context: .
+      dockerfile: ocrEnsemble/Dockerfile
+    image: ai-ocr-ensemble
+    environment:
+      DEBUG_ARTIFACT_DIR: /tmp/ocr-ensemble-debug
+      OCR_ENSEMBLE_MODEL_URLS: >-
+        {"ppocr":"http://ocr-api:8020/ocr","omniparser":"http://omniparser-api:8000/ocr","paddleocr-vl":"http://paddleocr-vl-api:8000/ocr","surya":"http://surya-api:8000/ocr"}
+    ports:
+      - "28120:8000"
+    volumes:
+      - ./ocr-ensemble-debug:/tmp/ocr-ensemble-debug:rw
+    depends_on:
+      - ocr-api
+      - omniparser-api
+      - paddleocr-vl-api
+      - surya-api
+    networks: ["ai-net"]
+
+  target-ensemble-api:
+    profiles: ["ui-vision"]
+    build:
+      context: .
+      dockerfile: targetEnsemble/Dockerfile
+    image: ai-target-ensemble
+    environment:
+      DEBUG_ARTIFACT_DIR: /tmp/target-ensemble-debug
+      TARGET_ENSEMBLE_MODEL_URLS: >-
+        {"groundnext":"http://groundnext-api:8000/infer","aria-ui":"http://aria-ui-api:8000/infer","phi-ground":"http://phi-ground-api:8000/infer"}
+      TARGET_ENSEMBLE_WEIGHTS: >-
+        {"groundnext":0.45,"aria-ui":0.25,"phi-ground":0.20,"candidate_prior":0.10}
+    ports:
+      - "28130:8000"
+    volumes:
+      - ./target-ensemble-debug:/tmp/target-ensemble-debug:rw
+    depends_on:
+      - groundnext-api
+      - aria-ui-api
+      - phi-ground-api
+    networks: ["ai-net"]
+
 
   rtdetr-api:
     build:
@@ -70,6 +215,9 @@ services:
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
       TASK_PLANNER_URL: http://task-planner:8000/v1/actions/next
       PLANNER_API_KEY: taskPlannerApiSecret
+      TARGET_ENSEMBLE_API_URL: http://target-ensemble-api:8000/infer
+      TARGET_ENSEMBLE_SHADOW_MODE: "0"
+      TARGET_ENSEMBLE_SHADOW_DEBUG: "1"
       # Explicitly set Firefox binary and profile (adjust profile dir name if different)
       FIREFOX_BIN: "/usr/bin/firefox-esr"
       FIREFOX_PROFILE_PATH: "/root/.mozilla/firefox/agent1.default-esr"
@@ -104,6 +252,9 @@ services:
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
       TASK_PLANNER_URL: http://task-planner:8000/v1/actions/next
       PLANNER_API_KEY: taskPlannerApiSecret
+      TARGET_ENSEMBLE_API_URL: http://target-ensemble-api:8000/infer
+      TARGET_ENSEMBLE_SHADOW_MODE: "0"
+      TARGET_ENSEMBLE_SHADOW_DEBUG: "1"
       FIREFOX_BIN: "/usr/bin/firefox-esr"
       FIREFOX_PROFILE_PATH: "/root/.mozilla/firefox/agent2.default-esr"
       AGENT_GOAL: "Open Firefox if not already. For each of 10 different websites (e.g., amazon.com, ebay.com, tcgplayer.com, walmart.com, target.com, bestbuy.com, pokemoncenter.com, cardkingdom.com, trollandtoad.com, coolstuffinc.com), do: Navigate to the site, use search bar to query 'pokemon booster box', wait for results page, scan via OCR for prices (look for '$' followed by numbers), note the lowest price found on that site. After all sites, compare the lowest prices collected. Use terminal (open if needed, type commands) to create/append to 'pokemon_price.txt' with the overall cheapest price, site, and date. Handle any popups, ads, or load issues by closing/refreshing; if a site blocks, skip and note. If file ops fail in one way, try text editor alternative like gedit to save the file."

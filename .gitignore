@@ -4,3 +4,12 @@
 planner-dumps/
 agent-debug/
 planner_payload.json
+.venv-ui-vision/
+
+# UI vision generated outputs
+artifacts/
+ocr-ensemble-debug/
+target-ensemble-debug/
+ui-model-debug/
+
+__pycache__/

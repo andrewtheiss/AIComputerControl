@@ -52,6 +52,11 @@ POST_ACTION_VERIFY_STABLE_HITS = max(1, int(os.environ.get("POST_ACTION_VERIFY_S
 NOOP_SIMILARITY_THRESHOLD = float(os.environ.get("AGENT_NOOP_SIMILARITY_THRESHOLD", "0.985"))
 A11Y_BRIDGE_URL = os.environ.get("A11Y_BRIDGE_URL", "").strip()
 A11Y_FETCH_TIMEOUT_S = float(os.environ.get("A11Y_FETCH_TIMEOUT_S", "0.45"))
+TARGET_ENSEMBLE_API_URL = os.environ.get("TARGET_ENSEMBLE_API_URL", "").strip()
+TARGET_ENSEMBLE_SHADOW_MODE = os.environ.get("TARGET_ENSEMBLE_SHADOW_MODE", "0") == "1"
+TARGET_ENSEMBLE_SHADOW_TOP_K = max(1, min(10, int(os.environ.get("TARGET_ENSEMBLE_SHADOW_TOP_K", "5"))))
+TARGET_ENSEMBLE_SHADOW_TIMEOUT_S = float(os.environ.get("TARGET_ENSEMBLE_SHADOW_TIMEOUT_S", "8.0"))
+TARGET_ENSEMBLE_SHADOW_DEBUG = os.environ.get("TARGET_ENSEMBLE_SHADOW_DEBUG", "1") == "1"
 
 # Optional LLM (OpenAI-compatible or local)
 # Configure one of the following:
@@ -1787,6 +1792,7 @@ class ActionExecutorDynamic:
                 ocr_box_ov     = it.get("ocr_box_overlay_path") or ""
                 click_tgt_ov   = it.get("click_target_overlay_path") or ""
                 level_paths    = it.get("level_overlay_paths") or []
+                shadow_targeting = it.get("target_ensemble_shadow") or {}
 
                 subbox_applied = bool(result.get("subbox_applied", False))
                 vlm_used       = bool(result.get("vlm_used", False))
@@ -1798,6 +1804,12 @@ class ActionExecutorDynamic:
 
                 ocr_box_val  = result.get("ocr_box") or ""
                 click_abs_val = result.get("click_abs") or result.get("clicked_abs") or ""
+                shadow_final = (shadow_targeting.get("final_prediction") or {}) if isinstance(shadow_targeting, dict) else {}
+                shadow_desc = ""
+                if shadow_final:
+                    shadow_desc = f"{shadow_final.get('candidate_id', '')} score={shadow_final.get('score', '')}"
+                elif shadow_targeting.get("error"):
+                    shadow_desc = f"error={shadow_targeting.get('error')}"
 
                 is_click_action = executed_action in (
                     "click_text", "click_any_text", "click_near_text",
@@ -1892,6 +1904,7 @@ class ActionExecutorDynamic:
   <div class="txt"><b>blocker</b> {blocker_class}</div>
   <div class="txt"><b>recovery</b> strategy={recovery_strategy} effect={recovery_effect}</div>
   <div class="txt"><b>targeting</b> {targeting_source}{subbox_lbl}{vlm_lbl}{synth_lbl}</div>
+  <div class="txt"><b>shadow ensemble</b> {shadow_desc}</div>
   <div class="txt"><b>ocr box</b> {ocr_box_val}  <b>click abs</b> {click_abs_val}  <b>origin</b> {box_origin}</div>
   <div class="txt"><b>override</b> {executor_override_reason}</div>
   <div class="txt"><b>evidence</b> {verification_evidence}</div>
@@ -3350,6 +3363,113 @@ document.addEventListener('keydown',function(e){{
             "focused_editable": bool(ax.get("focused_editable", False)),
         }
 
+    def _shadow_candidate_actions(self, element: Dict[str, Any]) -> List[str]:
+        role = str(element.get("role", "") or "").lower()
+        text = str(element.get("text", "") or "").strip()
+        source = str(element.get("source", "") or "").lower()
+        if role in ("textbox", "entry", "textarea", "input"):
+            return ["click", "type", "focus"]
+        if role in ("button", "link", "tab", "menuitem", "checkbox", "radio"):
+            return ["click", "hover"]
+        if source == "ax" and role:
+            return ["click", "focus"]
+        if text:
+            return ["click"]
+        return ["click"]
+
+    def _build_target_ensemble_candidates(self, ui_elements: List[Dict[str, Any]], limit: int = 80) -> List[Dict[str, Any]]:
+        candidates: List[Dict[str, Any]] = []
+        for idx, element in enumerate(ui_elements[:limit], start=1):
+            box = element.get("box") or [0, 0, 0, 0]
+            if not isinstance(box, list) or len(box) != 4:
+                continue
+            candidates.append(
+                {
+                    "id": f"C{idx:03d}",
+                    "box": [int(v) for v in box],
+                    "text": str(element.get("text", "") or ""),
+                    "score": float(element.get("score", 0.0) or 0.0),
+                    "role": element.get("role"),
+                    "source": element.get("source"),
+                    "allowed_actions": self._shadow_candidate_actions(element),
+                    "extras": {},
+                }
+            )
+        return candidates
+
+    def _build_target_ensemble_instruction(self, action: str, params: Dict[str, Any]) -> str:
+        if action == "click_text":
+            target = params.get("regex") or params.get("fuzzy_text") or params.get("any_regex")
+            if target:
+                return f"click the UI element matching {target}"
+        if action == "click_any_text":
+            patterns = params.get("patterns") or params.get("texts") or []
+            if isinstance(patterns, list) and patterns:
+                return f"click the first matching UI element among {patterns[0]}"
+        if action == "click_near_text":
+            anchor = params.get("anchor_regex") or params.get("anchor")
+            if anchor:
+                return f"click near the UI element matching {anchor}"
+        if action == "click_box":
+            return "click the intended target inside the provided bounding box"
+        return AGENT_GOAL or f"resolve the next {action} step"
+
+    def _target_ensemble_shadow(
+        self,
+        action: str,
+        params: Dict[str, Any],
+        ui_elements: List[Dict[str, Any]],
+        screenshot_b64: Optional[str],
+    ) -> Optional[Dict[str, Any]]:
+        if not TARGET_ENSEMBLE_SHADOW_MODE or not TARGET_ENSEMBLE_API_URL:
+            return None
+        if action not in ("click_text", "click_any_text", "click_near_text", "click_box"):
+            return None
+        candidates = self._build_target_ensemble_candidates(ui_elements)
+        if not candidates:
+            return None
+        shot = (screenshot_b64 or "").strip()
+        if not shot and self.last_img is not None:
+            try:
+                jpg = encode_jpeg_bgr_resized(self.last_img, q=max(25, min(90, int(PLANNER_SCREENSHOT_JPEG_QUALITY))), max_dim=PLANNER_SCREENSHOT_MAX_DIM)
+                shot = base64.b64encode(jpg).decode("ascii")
+            except Exception:
+                shot = ""
+        if not shot:
+            return None
+        payload = {
+            "instruction": self._build_target_ensemble_instruction(action, params),
+            "history": [str((item or {}).get("action", "")) for item in self.history[-4:]],
+            "screenshot_b64": shot,
+            "screenshot_mime": "image/jpeg",
+            "candidates": candidates,
+            "top_k": TARGET_ENSEMBLE_SHADOW_TOP_K,
+            "debug": bool(self.trace_enabled and TARGET_ENSEMBLE_SHADOW_DEBUG),
+        }
+        endpoint = TARGET_ENSEMBLE_API_URL.rstrip("/") + ("/infer/debug" if payload["debug"] and not TARGET_ENSEMBLE_API_URL.rstrip("/").endswith("/infer/debug") else "")
+        if not payload["debug"] and not endpoint.endswith("/infer"):
+            endpoint = TARGET_ENSEMBLE_API_URL.rstrip("/") + ("" if TARGET_ENSEMBLE_API_URL.rstrip("/").endswith("/infer") else "/infer")
+        try:
+            resp = self.session.post(endpoint, json=payload, timeout=(2.0, TARGET_ENSEMBLE_SHADOW_TIMEOUT_S))
+            resp.raise_for_status()
+            data = resp.json()
+            final_pred = data.get("final_prediction") or {}
+            self._log(
+                "info",
+                "target_ensemble.shadow",
+                {
+                    "requested_action": action,
+                    "instruction": payload["instruction"],
+                    "candidate_count": len(candidates),
+                    "final_candidate_id": final_pred.get("candidate_id"),
+                    "final_score": final_pred.get("score"),
+                },
+            )
+            return data
+        except Exception as e:
+            self._log("warn", "target_ensemble.shadow_failed", {"action": action, "error": str(e)})
+            return {"status": "error", "error": str(e), "requested_action": action}
+
     def _snapshot_similarity(self, before: Dict[str, Any], after: Dict[str, Any]) -> Optional[float]:
         vb = before.get("signature_vec")
         va = after.get("signature_vec")
@@ -4479,6 +4599,7 @@ document.addEventListener('keydown',function(e){{
 
             # 3) Act
             result = {"status":"failure","error_code":"UNKNOWN_ACTION","error_message": op}
+            shadow_targeting = None
             try:
                 policy = self._blocker_policy_directive(op, params, pre_action_snapshot)
                 if policy.get("decision") == "override":
@@ -4503,6 +4624,7 @@ document.addEventListener('keydown',function(e){{
                     executed_strategy = str(policy.get("strategy") or self._action_family(op, params))
                     policy_blocker = policy.get("blocker") or {}
 
+                shadow_targeting = self._target_ensemble_shadow(op, params, ui_elements, screenshot_b64)
                 guard_result = self._executor_guard_result(op, params, pre_action_snapshot)
                 if guard_result is not None:
                     # FIX D: If the guard suggests a keyboard action, execute it directly
@@ -4567,6 +4689,7 @@ document.addEventListener('keydown',function(e){{
                                 "ts": now_utc_iso(),
                                 "decision": {"action": planner_op, "parameters": planner_params, "reasoning": reasoning, "completed": completed},
                                 "result": result,
+                                "target_ensemble_shadow": shadow_targeting or {},
                                 "frame_path": frame_path,
                                 "post_frame_path": post_frame_path,
                                 "crop_overlay_path": "",
@@ -4628,6 +4751,7 @@ document.addEventListener('keydown',function(e){{
                                     "ts": now_utc_iso(),
                                     "decision": {"action": f"consensus:{intent}", "parameters": {"verify": verify_patterns}, "reasoning": reasoning, "completed": completed},
                                     "result": result,
+                                    "target_ensemble_shadow": shadow_targeting or {},
                                     "frame_path": frame_path,
                                     "post_frame_path": post_frame_path,
                                     "crop_overlay_path": crop_overlay,
@@ -4705,6 +4829,7 @@ document.addEventListener('keydown',function(e){{
                     "ts": now_utc_iso(),
                     "decision": {"action": planner_op, "parameters": planner_params, "reasoning": reasoning, "completed": completed},
                     "result": result,
+                    "target_ensemble_shadow": shadow_targeting or {},
                     "frame_path": frame_path,
                     "post_frame_path": post_frame_path,
                     "crop_overlay_path": crop_overlay,

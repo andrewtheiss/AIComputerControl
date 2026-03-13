@@ -24,4 +24,4 @@ ENV OCR_BACKEND=ppocr \
     UVICORN_WORKERS=2
 
 EXPOSE 8020
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8020", "--workers", "2"]
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port 8020 --workers ${UVICORN_WORKERS:-2}"]

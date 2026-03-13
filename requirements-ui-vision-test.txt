@@ -1,0 +1,4 @@
+-r modelService/requirements.txt
+-r ocrEnsemble/requirements.txt
+-r targetEnsemble/requirements.txt
+httpx

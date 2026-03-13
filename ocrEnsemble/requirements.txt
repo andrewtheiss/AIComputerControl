@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pydantic>=2
+numpy
+opencv-python-headless>=4.8
+pillow>=10.0
+requests
