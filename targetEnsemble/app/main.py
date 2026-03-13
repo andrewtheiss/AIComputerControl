@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 import requests
 from fastapi import FastAPI
@@ -27,12 +27,37 @@ DEFAULT_WEIGHTS = {
     "candidate_prior": 0.10,
 }
 
+DEFAULT_GATING = {
+    "top1_threshold": 0.72,
+    "margin_threshold": 0.12,
+    "min_agreeing_models": 2,
+    "cluster_iou_threshold": 0.50,
+    "repair_top_n": 3,
+}
+
 
 def _load_json_env(name: str, default: Dict[str, Any]) -> Dict[str, Any]:
     raw = str(os.environ.get(name, "") or "").strip()
     if not raw:
         return dict(default)
     return {str(key): value for key, value in json.loads(raw).items()}
+
+
+def _box_iou(a: List[int], b: List[int]) -> float:
+    ax1, ay1, ax2, ay2 = [int(v) for v in a]
+    bx1, by1, bx2, by2 = [int(v) for v in b]
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+    iw = max(0, ix2 - ix1)
+    ih = max(0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    a_area = max(1, (ax2 - ax1) * (ay2 - ay1))
+    b_area = max(1, (bx2 - bx1) * (by2 - by1))
+    return inter / float(max(1, a_area + b_area - inter))
 
 
 def _candidate_prior(candidate: Dict[str, Any]) -> float:
@@ -76,6 +101,7 @@ def create_app() -> FastAPI:
     debug_dir = str(os.environ.get("DEBUG_ARTIFACT_DIR", "/tmp/target-ensemble-debug") or "/tmp/target-ensemble-debug")
     model_urls = _load_json_env("TARGET_ENSEMBLE_MODEL_URLS", DEFAULT_MODEL_URLS)
     weights = _load_json_env("TARGET_ENSEMBLE_WEIGHTS", DEFAULT_WEIGHTS)
+    gating = _load_json_env("TARGET_ENSEMBLE_GATING", DEFAULT_GATING)
     session = requests.Session()
     app = FastAPI(title="Target Ensemble API")
 
@@ -99,6 +125,8 @@ def create_app() -> FastAPI:
         t0 = time.perf_counter()
         image_bgr = decode_image_b64(payload.screenshot_b64 or "")
         per_model: Dict[str, Any] = {}
+        per_model_top1: Dict[str, Dict[str, Any]] = {}
+        candidate_map = {candidate.id: candidate for candidate in payload.candidates}
         candidate_scores: Dict[str, Dict[str, float]] = {
             candidate.id: {"candidate_prior": _candidate_prior(candidate.model_dump())}
             for candidate in payload.candidates
@@ -108,6 +136,9 @@ def create_app() -> FastAPI:
             try:
                 result = _call_model(session, model_id=model_id, model_url=model_url, payload=payload.model_dump())
                 per_model[model_id] = result
+                top_preds = list(result.get("predictions") or [])
+                if top_preds:
+                    per_model_top1[model_id] = dict(top_preds[0])
                 for pred in result.get("predictions", []):
                     cid = str(pred.get("candidate_id", ""))
                     candidate_scores.setdefault(cid, {"candidate_prior": 0.0})[model_id] = float(pred.get("p", 0.0))
@@ -133,14 +164,81 @@ def create_app() -> FastAPI:
             )
         ranked.sort(key=lambda item: item["score"], reverse=True)
 
+        top1 = ranked[0] if ranked else None
+        top2 = ranked[1] if len(ranked) > 1 else None
+        top1_score = float((top1 or {}).get("score", 0.0) or 0.0)
+        top2_score = float((top2 or {}).get("score", 0.0) or 0.0)
+        score_margin = round(top1_score - top2_score, 6) if top1 else 0.0
+
+        cluster_ids: List[str] = []
+        agreeing_models: List[str] = []
+        if top1:
+            top1_box = list(top1.get("box") or [0, 0, 0, 0])
+            cluster_ids = [
+                candidate.id
+                for candidate in payload.candidates
+                if candidate.id == top1["candidate_id"] or _box_iou(candidate.box, top1_box) >= float(gating.get("cluster_iou_threshold", 0.50))
+            ]
+            for model_id, pred in per_model_top1.items():
+                if str(pred.get("candidate_id", "")) in cluster_ids:
+                    agreeing_models.append(model_id)
+
+        action_allowed = False
+        if top1 and top1["candidate_id"] in candidate_map:
+            chosen = candidate_map[top1["candidate_id"]]
+            action_allowed = str(top1.get("action", "")) in list(chosen.allowed_actions or ["click"])
+
+        reason_codes: List[str] = []
+        if not top1:
+            reason_codes.append("no_candidates")
+        else:
+            if top1_score < float(gating.get("top1_threshold", 0.72)):
+                reason_codes.append("score_below_threshold")
+            if score_margin < float(gating.get("margin_threshold", 0.12)):
+                reason_codes.append("margin_below_threshold")
+            if len(agreeing_models) < int(gating.get("min_agreeing_models", 2)):
+                reason_codes.append("insufficient_model_agreement")
+            if not action_allowed:
+                reason_codes.append("action_not_allowed")
+
+        auto_execute = bool(top1 and not reason_codes)
+        repair_candidates = ranked[: max(1, int(gating.get("repair_top_n", 3) or 3))]
+        repair_plan = None
+        if not auto_execute:
+            repair_plan = {
+                "status": "needs_repair",
+                "strategy": "zoom_rerank_top_candidates",
+                "candidate_ids": [item["candidate_id"] for item in repair_candidates],
+                "boxes": [item["box"] for item in repair_candidates],
+                "reason_codes": reason_codes,
+            }
+
         response = {
             "model_id": "target-ensemble",
             "backend": "fanout",
             "latency_ms": int((time.perf_counter() - t0) * 1000),
-            "final_prediction": ranked[0] if ranked else None,
+            "final_prediction": top1,
             "ranked_candidates": ranked[: max(1, payload.top_k)],
             "candidate_scores": candidate_scores,
             "weights": weights,
+            "gating": {
+                "top1_threshold": float(gating.get("top1_threshold", 0.72)),
+                "margin_threshold": float(gating.get("margin_threshold", 0.12)),
+                "min_agreeing_models": int(gating.get("min_agreeing_models", 2)),
+                "cluster_iou_threshold": float(gating.get("cluster_iou_threshold", 0.50)),
+                "top1_score": top1_score,
+                "top2_score": top2_score,
+                "score_margin": score_margin,
+                "agreeing_models": agreeing_models,
+                "agreeing_model_count": len(agreeing_models),
+                "cluster_candidate_ids": cluster_ids,
+                "action_allowed": action_allowed,
+                "reason_codes": reason_codes,
+            },
+            "auto_execute": auto_execute,
+            "resolution_mode": "auto_execute" if auto_execute else "repair",
+            "repair_candidates": repair_candidates,
+            "repair_plan": repair_plan,
             "per_model": per_model if payload.debug or force_debug else {key: {"status": "ok"} for key in model_urls.keys()},
         }
         if payload.debug or force_debug:
@@ -172,7 +270,7 @@ def create_app() -> FastAPI:
             debug=True,
             candidates=[
                 {"id": "C1", "box": [700, 120, 820, 170], "text": "Sign in", "score": 0.96, "role": "button", "allowed_actions": ["click"]},
-                {"id": "C2", "box": [430, 360, 640, 410], "text": "Continue", "score": 0.75, "role": "button", "allowed_actions": ["click"]},
+                {"id": "C2", "box": [430, 360, 640, 410], "text": "Cancel", "score": 0.18, "role": "button", "allowed_actions": ["click"]},
             ],
         )
         return _run(payload, force_debug=True)

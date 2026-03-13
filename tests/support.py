@@ -106,6 +106,12 @@ def running_compose_services(
     no_deps: bool = False,
     timeout_s: float = 120.0,
 ):
+    build_cmd = ["docker", "compose"]
+    if profile:
+        build_cmd.extend(["--profile", profile])
+    build_cmd.extend(["build", *services])
+    run_command(build_cmd, timeout_s=timeout_s)
+
     up_cmd = ["docker", "compose"]
     if profile:
         up_cmd.extend(["--profile", profile])
@@ -117,7 +123,10 @@ def running_compose_services(
     try:
         yield
     finally:
-        stop_cmd = ["docker", "compose", "stop", *services]
+        stop_cmd = ["docker", "compose"]
+        if profile:
+            stop_cmd.extend(["--profile", profile])
+        stop_cmd.extend(["stop", *services])
         subprocess.run(
             stop_cmd,
             cwd=str(REPO_ROOT),

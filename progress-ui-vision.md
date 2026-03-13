@@ -12,6 +12,7 @@ The new UI vision work is partially scaffolded and partially verified.
 - The real `ocr-api` and `ocr-ensemble-api` have now been re-verified with a readiness wait and a live-image OCR probe.
 - The agent-side integration is still shadow-only, but shadow mode is now enabled in compose.
 - A one-command verifier now exists at `tools/verify_ui_vision_stack.py`.
+- `targetEnsemble` now includes gated resolver output for auto-execute vs repair-mode decisions.
 
 ## What Was Verified Today
 
@@ -84,7 +85,7 @@ wsl bash -lc 'cd /home/theiss/AIComputerControl && .venv-ui-vision/bin/python -m
 
 Observed result:
 
-- `Ran 8 tests`
+- `Ran 9 tests`
 - `OK`
 
 This means the current automated verification path covers:
@@ -92,6 +93,7 @@ This means the current automated verification path covers:
 - mock model-service container boot plus selftest
 - mock OCR ensemble container boot plus selftest
 - mock target ensemble container boot plus selftest
+- gated resolver behavior for both confident and ambiguous cases
 - candidate graph building and merge behavior
 - candidate building
 - action inference
@@ -190,11 +192,12 @@ Likely interpretation:
 - added `tools/verify_ui_vision_stack.py` for one-command verification
 - added agent-side shadow plumbing for target ensemble
 - added compose definitions for the new services
+- added gated resolver outputs to `targetEnsemble`
 
 ### Partially done
 
 - OCR ensemble fan-out and merge exists and is now verified with live `ppocr`, but it still returns merged OCR words/lines rather than a full interactable graph
-- target ensemble weighting exists, but only as a simple weighted ranker
+- target ensemble now includes threshold, margin, and agreement gating plus repair-mode output, but it does not yet perform zoom-crop reruns
 - candidate graph building exists and is wired into the harness and agent shadow candidate generation, but it is not yet a standalone service
 - debug output exists, but not yet at the full artifact granularity originally requested
 - harness exists and a one-command verifier exists, but there is not yet a full benchmark/eval suite for every stage
@@ -210,9 +213,6 @@ Likely interpretation:
   - Phi-Ground
 - standalone candidate graph service with independent `/health` and `/infer`-style verification
 - full gating and repair logic:
-  - top-1 threshold
-  - top-1 minus top-2 margin
-  - 2-of-3 agreement rule
   - repair crop reruns
   - final validator stage
 - live agent integration for click execution

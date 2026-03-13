@@ -3416,10 +3416,17 @@ document.addEventListener('keydown',function(e){{
             source = str(element.get("source", "") or "")
             allowed_actions = self._shadow_candidate_actions(element)
             score = float(element.get("score", 0.0) or 0.0)
+            _src_lower = source.lower()
+            _is_interactable = (
+                role in ("button", "checkbox", "combobox", "entry", "input", "link", "menuitem", "radio", "tab", "textarea", "textbox")
+                or _src_lower in ("ax", "det")
+                or "omniparser" in _src_lower
+            )
             interactable_score = min(
                 1.0,
                 score
-                + (0.18 if (role in ("button", "link", "textbox", "input", "textarea") or source.lower() in ("ax", "det")) else 0.0)
+                + (0.18 if _is_interactable else 0.0)
+                + (0.08 if role in ("button", "link", "textbox", "input", "textarea") else 0.0)
                 + (0.04 if "click" in allowed_actions else 0.0),
             )
             node = {
@@ -3436,7 +3443,25 @@ document.addEventListener('keydown',function(e){{
             for group in groups:
                 same_text = bool(text_key) and text_key == group["text_key"]
                 iou = self._shadow_box_iou(norm_box, group["box"])
-                if iou >= 0.65 or (same_text and iou >= 0.18) or ((not text_key or not group["text_key"]) and iou >= 0.45):
+                if iou >= 0.65:
+                    matched = group
+                    break
+                if same_text and iou >= 0.18:
+                    matched = group
+                    break
+                if same_text:
+                    _gcx = (group["box"][0] + group["box"][2]) / 2.0
+                    _gcy = (group["box"][1] + group["box"][3]) / 2.0
+                    _ncx = (norm_box[0] + norm_box[2]) / 2.0
+                    _ncy = (norm_box[1] + norm_box[3]) / 2.0
+                    if ((_ncx - _gcx) ** 2 + (_ncy - _gcy) ** 2) ** 0.5 <= 18.0:
+                        matched = group
+                        break
+                if (not text_key or not group["text_key"]) and iou >= 0.45:
+                    matched = group
+                    break
+                _group_is = max((n["interactable_score"] for n in group["nodes"]), default=0.0)
+                if interactable_score >= 0.65 and _group_is >= 0.65 and iou >= 0.35:
                     matched = group
                     break
             if matched is None:
@@ -3559,9 +3584,12 @@ document.addEventListener('keydown',function(e){{
             "top_k": TARGET_ENSEMBLE_SHADOW_TOP_K,
             "debug": bool(self.trace_enabled and TARGET_ENSEMBLE_SHADOW_DEBUG),
         }
-        endpoint = TARGET_ENSEMBLE_API_URL.rstrip("/") + ("/infer/debug" if payload["debug"] and not TARGET_ENSEMBLE_API_URL.rstrip("/").endswith("/infer/debug") else "")
-        if not payload["debug"] and not endpoint.endswith("/infer"):
-            endpoint = TARGET_ENSEMBLE_API_URL.rstrip("/") + ("" if TARGET_ENSEMBLE_API_URL.rstrip("/").endswith("/infer") else "/infer")
+        _base = TARGET_ENSEMBLE_API_URL.rstrip("/")
+        if _base.endswith("/infer/debug"):
+            _base = _base[: -len("/infer/debug")]
+        elif _base.endswith("/infer"):
+            _base = _base[: -len("/infer")]
+        endpoint = _base + ("/infer/debug" if payload["debug"] else "/infer")
         try:
             resp = self.session.post(endpoint, json=payload, timeout=(2.0, TARGET_ENSEMBLE_SHADOW_TIMEOUT_S))
             resp.raise_for_status()
