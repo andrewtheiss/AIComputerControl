@@ -10,9 +10,9 @@ The new UI vision work is partially scaffolded and partially verified.
 - The replay/harness utility works for pure data-path tests.
 - The service verification tests were replaced with container-backed integration tests and now pass cleanly in the local WSL environment.
 - The real `ocr-api` and `ocr-ensemble-api` have now been re-verified with a readiness wait and a live-image OCR probe.
-- The agent-side integration is still shadow-only, but shadow mode is now enabled in compose.
+- The agent now uses target-ensemble decisions beyond shadow mode for gated auto-execute cases across all current click families: `click_text`, `click_any_text`, `click_near_text`, and `click_box`.
 - A one-command verifier now exists at `tools/verify_ui_vision_stack.py`.
-- `targetEnsemble` now includes gated resolver output for auto-execute vs repair-mode decisions.
+- `targetEnsemble` now includes gated resolver output for auto-execute vs repair-mode decisions, plus repair crop reruns that can promote a repair case when the rerun becomes decisive.
 
 ## What Was Verified Today
 
@@ -75,17 +75,18 @@ These tests now pass:
 - `tests.test_ocr_ensemble`
 - `tests.test_target_ensemble`
 - `tests.test_ui_vision_harness`
+- `tests.test_target_ensemble_shadow_utils`
 - `tools/verify_ui_vision_stack.py` also completes successfully
 
 Verified command:
 
 ```powershell
-wsl bash -lc 'cd /home/theiss/AIComputerControl && .venv-ui-vision/bin/python -m unittest tests.test_model_service tests.test_ocr_ensemble tests.test_target_ensemble tests.test_ui_vision_harness'
+wsl bash -lc 'cd /home/theiss/AIComputerControl && .venv-ui-vision/bin/python -m unittest tests.test_model_service tests.test_ocr_ensemble tests.test_target_ensemble tests.test_ui_vision_harness tests.test_target_ensemble_shadow_utils'
 ```
 
 Observed result:
 
-- `Ran 9 tests`
+- `Ran 22 tests`
 - `OK`
 
 This means the current automated verification path covers:
@@ -93,11 +94,28 @@ This means the current automated verification path covers:
 - mock model-service container boot plus selftest
 - mock OCR ensemble container boot plus selftest
 - mock target ensemble container boot plus selftest
-- gated resolver behavior for both confident and ambiguous cases
+- gated resolver behavior for confident, ambiguous, and repair-rerun-promoted cases
 - candidate graph building and merge behavior
 - candidate building
 - action inference
 - instruction derivation
+- shadow endpoint normalization and shadow merge/score parity helpers
+- gated agent execution overrides for `click_text`, `click_any_text`, `click_near_text`, and `click_box`
+
+Additional direct runtime verification:
+
+- the new final validator stage was exercised by calling the `targetEnsemble` `/infer` endpoint function directly with mock backends
+- the container-backed `tests.test_target_ensemble` suite was re-run successfully after disk cleanup
+- verified pass case:
+  - strong `Sign in` candidate returns `auto_execute: true`
+  - validator returns `status: "passed"`
+- verified fail case:
+  - low-prior `Sign in` candidate returns `auto_execute: false`
+  - resolution mode becomes `repair_validation_failed`
+  - validator returns `validator_candidate_prior_below_threshold`
+- verified repair-rerun pass case:
+  - rerun promotion returns `resolution_mode: "repair_rerun_auto_execute"`
+  - validator returns `status: "passed"` with `stage: "repair_rerun"`
 
 ## Reproduced Failures
 
@@ -191,14 +209,18 @@ Likely interpretation:
 - added `tools/ui_vision_harness.py` for replay/export workflows
 - added `tools/verify_ui_vision_stack.py` for one-command verification
 - added agent-side shadow plumbing for target ensemble
+- added agent-side gated execution integration for decisive target-ensemble results across all current click families
 - added compose definitions for the new services
 - added gated resolver outputs to `targetEnsemble`
+- added repair crop reruns to `targetEnsemble` with regression tests
+- added final validator stage to `targetEnsemble`
 
 ### Partially done
 
 - OCR ensemble fan-out and merge exists and is now verified with live `ppocr`, but it still returns merged OCR words/lines rather than a full interactable graph
-- target ensemble now includes threshold, margin, and agreement gating plus repair-mode output, but it does not yet perform zoom-crop reruns
-- candidate graph building exists and is wired into the harness and agent shadow candidate generation, but it is not yet a standalone service
+- target ensemble now includes threshold, margin, agreement gating, repair crop reruns, and a final validator stage
+- candidate graph building exists and is wired into the harness and agent target-ensemble path, but it is not yet a standalone service
+- live agent integration now exists for all current click families, but it is still gated and only takes over when the target ensemble returns a decisive, constraint-compatible auto-execute result
 - debug output exists, but not yet at the full artifact granularity originally requested
 - harness exists and a one-command verifier exists, but there is not yet a full benchmark/eval suite for every stage
 
@@ -212,12 +234,8 @@ Likely interpretation:
   - Aria-UI
   - Phi-Ground
 - standalone candidate graph service with independent `/health` and `/infer`-style verification
-- full gating and repair logic:
-  - repair crop reruns
-  - final validator stage
-- live agent integration for click execution
+- live agent integration for all click families
 - robust benchmark runs over larger real corpora
-- live agent integration for click execution beyond shadow mode
 
 ## Safe Verification Plan
 

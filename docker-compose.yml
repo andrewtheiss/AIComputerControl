@@ -218,6 +218,7 @@ services:
       TARGET_ENSEMBLE_API_URL: http://target-ensemble-api:8000/infer
       TARGET_ENSEMBLE_SHADOW_MODE: "1"
       TARGET_ENSEMBLE_SHADOW_DEBUG: "1"
+      TARGET_ENSEMBLE_EXECUTION_MODE: "1"
       # Explicitly set Firefox binary and profile (adjust profile dir name if different)
       FIREFOX_BIN: "/usr/bin/firefox-esr"
       FIREFOX_PROFILE_PATH: "/root/.mozilla/firefox/agent1.default-esr"
@@ -255,6 +256,7 @@ services:
       TARGET_ENSEMBLE_API_URL: http://target-ensemble-api:8000/infer
       TARGET_ENSEMBLE_SHADOW_MODE: "1"
       TARGET_ENSEMBLE_SHADOW_DEBUG: "1"
+      TARGET_ENSEMBLE_EXECUTION_MODE: "1"
       FIREFOX_BIN: "/usr/bin/firefox-esr"
       FIREFOX_PROFILE_PATH: "/root/.mozilla/firefox/agent2.default-esr"
       AGENT_GOAL: "Open Firefox if not already. For each of 10 different websites (e.g., amazon.com, ebay.com, tcgplayer.com, walmart.com, target.com, bestbuy.com, pokemoncenter.com, cardkingdom.com, trollandtoad.com, coolstuffinc.com), do: Navigate to the site, use search bar to query 'pokemon booster box', wait for results page, scan via OCR for prices (look for '$' followed by numbers), note the lowest price found on that site. After all sites, compare the lowest prices collected. Use terminal (open if needed, type commands) to create/append to 'pokemon_price.txt' with the overall cheapest price, site, and date. Handle any popups, ads, or load issues by closing/refreshing; if a site blocks, skip and note. If file ops fail in one way, try text editor alternative like gedit to save the file."

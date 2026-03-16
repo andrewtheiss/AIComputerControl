@@ -16,6 +16,12 @@ import numpy as np
 import base64
 from ocr_client import OCRClient
 from rapidfuzz import fuzz, process as fuzz_process
+from target_ensemble_shadow_utils import (
+    build_target_ensemble_endpoint,
+    compute_interactable_score,
+    resolve_execution_override,
+    should_merge_shadow_node,
+)
 
 # -----------------------
 # Config
@@ -57,6 +63,7 @@ TARGET_ENSEMBLE_SHADOW_MODE = os.environ.get("TARGET_ENSEMBLE_SHADOW_MODE", "0")
 TARGET_ENSEMBLE_SHADOW_TOP_K = max(1, min(10, int(os.environ.get("TARGET_ENSEMBLE_SHADOW_TOP_K", "5"))))
 TARGET_ENSEMBLE_SHADOW_TIMEOUT_S = float(os.environ.get("TARGET_ENSEMBLE_SHADOW_TIMEOUT_S", "8.0"))
 TARGET_ENSEMBLE_SHADOW_DEBUG = os.environ.get("TARGET_ENSEMBLE_SHADOW_DEBUG", "1") == "1"
+TARGET_ENSEMBLE_EXECUTION_MODE = os.environ.get("TARGET_ENSEMBLE_EXECUTION_MODE", "0") == "1"
 
 # Optional LLM (OpenAI-compatible or local)
 # Configure one of the following:
@@ -3416,18 +3423,11 @@ document.addEventListener('keydown',function(e){{
             source = str(element.get("source", "") or "")
             allowed_actions = self._shadow_candidate_actions(element)
             score = float(element.get("score", 0.0) or 0.0)
-            _src_lower = source.lower()
-            _is_interactable = (
-                role in ("button", "checkbox", "combobox", "entry", "input", "link", "menuitem", "radio", "tab", "textarea", "textbox")
-                or _src_lower in ("ax", "det")
-                or "omniparser" in _src_lower
-            )
-            interactable_score = min(
-                1.0,
-                score
-                + (0.18 if _is_interactable else 0.0)
-                + (0.08 if role in ("button", "link", "textbox", "input", "textarea") else 0.0)
-                + (0.04 if "click" in allowed_actions else 0.0),
+            interactable_score = compute_interactable_score(
+                score=score,
+                role=role,
+                source=source,
+                allowed_actions=allowed_actions,
             )
             node = {
                 "box": norm_box,
@@ -3441,27 +3441,12 @@ document.addEventListener('keydown',function(e){{
             }
             matched = None
             for group in groups:
-                same_text = bool(text_key) and text_key == group["text_key"]
-                iou = self._shadow_box_iou(norm_box, group["box"])
-                if iou >= 0.65:
-                    matched = group
-                    break
-                if same_text and iou >= 0.18:
-                    matched = group
-                    break
-                if same_text:
-                    _gcx = (group["box"][0] + group["box"][2]) / 2.0
-                    _gcy = (group["box"][1] + group["box"][3]) / 2.0
-                    _ncx = (norm_box[0] + norm_box[2]) / 2.0
-                    _ncy = (norm_box[1] + norm_box[3]) / 2.0
-                    if ((_ncx - _gcx) ** 2 + (_ncy - _gcy) ** 2) ** 0.5 <= 18.0:
-                        matched = group
-                        break
-                if (not text_key or not group["text_key"]) and iou >= 0.45:
-                    matched = group
-                    break
-                _group_is = max((n["interactable_score"] for n in group["nodes"]), default=0.0)
-                if interactable_score >= 0.65 and _group_is >= 0.65 and iou >= 0.35:
+                if should_merge_shadow_node(
+                    norm_box=norm_box,
+                    text_key=text_key,
+                    interactable_score=interactable_score,
+                    group=group,
+                ):
                     matched = group
                     break
             if matched is None:
@@ -3584,12 +3569,7 @@ document.addEventListener('keydown',function(e){{
             "top_k": TARGET_ENSEMBLE_SHADOW_TOP_K,
             "debug": bool(self.trace_enabled and TARGET_ENSEMBLE_SHADOW_DEBUG),
         }
-        _base = TARGET_ENSEMBLE_API_URL.rstrip("/")
-        if _base.endswith("/infer/debug"):
-            _base = _base[: -len("/infer/debug")]
-        elif _base.endswith("/infer"):
-            _base = _base[: -len("/infer")]
-        endpoint = _base + ("/infer/debug" if payload["debug"] else "/infer")
+        endpoint = build_target_ensemble_endpoint(TARGET_ENSEMBLE_API_URL, payload["debug"])
         try:
             resp = self.session.post(endpoint, json=payload, timeout=(2.0, TARGET_ENSEMBLE_SHADOW_TIMEOUT_S))
             resp.raise_for_status()
@@ -4741,6 +4721,8 @@ document.addEventListener('keydown',function(e){{
             # 3) Act
             result = {"status":"failure","error_code":"UNKNOWN_ACTION","error_message": op}
             shadow_targeting = None
+            target_ensemble_execution = None
+            target_ensemble_resolved_target = None
             try:
                 policy = self._blocker_policy_directive(op, params, pre_action_snapshot)
                 if policy.get("decision") == "override":
@@ -4766,6 +4748,35 @@ document.addEventListener('keydown',function(e){{
                     policy_blocker = policy.get("blocker") or {}
 
                 shadow_targeting = self._target_ensemble_shadow(op, params, ui_elements, screenshot_b64)
+                if TARGET_ENSEMBLE_EXECUTION_MODE and op in ("click_text", "click_any_text", "click_near_text", "click_box"):
+                    target_ensemble_resolved_target = self._resolve_action_target(op, params, pre_action_snapshot, policy_blocker if isinstance(policy_blocker, dict) else None)
+                target_ensemble_execution = resolve_execution_override(
+                    action=op,
+                    params=params,
+                    shadow_targeting=shadow_targeting,
+                    enabled=TARGET_ENSEMBLE_EXECUTION_MODE,
+                    resolved_target=target_ensemble_resolved_target,
+                )
+                if target_ensemble_execution is not None:
+                    original_action = op
+                    original_params = dict(params)
+                    op = str(target_ensemble_execution.get("action") or op)
+                    params = self._canonicalize_params(op, target_ensemble_execution.get("params") or {})
+                    executed_strategy = "target_ensemble_auto_execute"
+                    self._log(
+                        "info",
+                        "target_ensemble.execution_override",
+                        {
+                            "from_action": original_action,
+                            "to_action": op,
+                            "candidate_id": (target_ensemble_execution.get("meta") or {}).get("candidate_id"),
+                            "text": (target_ensemble_execution.get("meta") or {}).get("text"),
+                            "score": (target_ensemble_execution.get("meta") or {}).get("score"),
+                            "resolution_mode": (target_ensemble_execution.get("meta") or {}).get("resolution_mode"),
+                            "original_params": original_params,
+                            "executed_params": params,
+                        },
+                    )
                 guard_result = self._executor_guard_result(op, params, pre_action_snapshot)
                 if guard_result is not None:
                     # FIX D: If the guard suggests a keyboard action, execute it directly
@@ -4942,6 +4953,8 @@ document.addEventListener('keydown',function(e){{
                 if override_reason:
                     result["executor_override_reason"] = override_reason
                     result["executor_override_from"] = {"action": planner_op, "parameters": planner_params}
+                if target_ensemble_execution is not None:
+                    result["target_ensemble_execution"] = dict(target_ensemble_execution.get("meta") or {})
                 if policy_blocker:
                     result.setdefault("blocker_class", policy_blocker.get("class"))
                     result.setdefault("blocker_signature", policy_blocker.get("signature"))
@@ -4956,6 +4969,8 @@ document.addEventListener('keydown',function(e){{
                 result["planner_requested_parameters"] = planner_params
                 result["executed_action"] = op
                 result["executed_parameters"] = params
+                if target_ensemble_execution is not None:
+                    result["target_ensemble_execution"] = dict(target_ensemble_execution.get("meta") or {})
 
             # 4) Record
             self.history.append({"action": op, "parameters": params, "result": result})
