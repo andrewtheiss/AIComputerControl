@@ -71,7 +71,9 @@ Important nuance:
 
 These tests now pass:
 
+- `tests.test_candidate_graph_service`
 - `tests.test_model_service`
+- `tests.test_model_service_providers`
 - `tests.test_ocr_ensemble`
 - `tests.test_target_ensemble`
 - `tests.test_ui_vision_harness`
@@ -81,17 +83,19 @@ These tests now pass:
 Verified command:
 
 ```powershell
-wsl bash -lc 'cd /home/theiss/AIComputerControl && .venv-ui-vision/bin/python -m unittest tests.test_model_service tests.test_ocr_ensemble tests.test_target_ensemble tests.test_ui_vision_harness tests.test_target_ensemble_shadow_utils'
+wsl bash -lc 'cd /home/theiss/AIComputerControl && .venv-ui-vision/bin/python -m unittest tests.test_candidate_graph_service tests.test_model_service tests.test_model_service_providers tests.test_ocr_ensemble tests.test_target_ensemble tests.test_ui_vision_harness tests.test_target_ensemble_shadow_utils'
 ```
 
 Observed result:
 
-- `Ran 22 tests`
+- `Ran 28 tests`
 - `OK`
 
 This means the current automated verification path covers:
 
+- standalone candidate graph service boot plus selftest
 - mock model-service container boot plus selftest
+- model-service `http_proxy` provider behavior
 - mock OCR ensemble container boot plus selftest
 - mock target ensemble container boot plus selftest
 - gated resolver behavior for confident, ambiguous, and repair-rerun-promoted cases
@@ -106,6 +110,9 @@ Additional direct runtime verification:
 
 - the new final validator stage was exercised by calling the `targetEnsemble` `/infer` endpoint function directly with mock backends
 - the container-backed `tests.test_target_ensemble` suite was re-run successfully after disk cleanup
+- the standalone `candidate-graph-api` service was verified over HTTP with `/health`, `/infer/debug`, and `/admin/selftest`
+- the harness can now call `candidate-graph-api` explicitly when `CANDIDATE_GRAPH_API_URL` is configured
+- the generic model sidecars now support real backend routing via `MODEL_BACKEND=http_proxy` plus `REMOTE_MODEL_URL`
 - verified pass case:
   - strong `Sign in` candidate returns `auto_execute: true`
   - validator returns `status: "passed"`
@@ -195,7 +202,7 @@ Likely interpretation:
 - `ocr-api` is the heaviest runtime in this stack and is the main candidate for GPU/runtime instability
 - `ocr-ensemble-api` depends on `ocr-api`, so it should not be used as an early verification step
 - the Dockerfile for `ocr-api` defaults to `UVICORN_WORKERS=2`; compose overrides this to `1`, but running the image outside compose without that override is a footgun for GPU model startup
-- all newly created model services are still `MODEL_BACKEND=mock`, so current success only proves transport/schema/debug plumbing, not real model integration
+- the generic model sidecars now support `MODEL_BACKEND=http_proxy` and per-service `REMOTE_MODEL_URL` settings, but the default compose configuration still runs them in `mock` mode unless real endpoints are configured
 
 ## Current Progress Against The Requested Architecture
 
@@ -210,31 +217,42 @@ Likely interpretation:
 - added `tools/verify_ui_vision_stack.py` for one-command verification
 - added agent-side shadow plumbing for target ensemble
 - added agent-side gated execution integration for decisive target-ensemble results across all current click families
+- added agent-side candidate graph service consumption with local fallback
+- added harness-side candidate graph service consumption with local fallback
 - added compose definitions for the new services
 - added gated resolver outputs to `targetEnsemble`
 - added repair crop reruns to `targetEnsemble` with regression tests
 - added final validator stage to `targetEnsemble`
-
-### Partially done
-
-- OCR ensemble fan-out and merge exists and is now verified with live `ppocr`, but it still returns merged OCR words/lines rather than a full interactable graph
-- target ensemble now includes threshold, margin, agreement gating, repair crop reruns, and a final validator stage
-- candidate graph building exists and is wired into the harness and agent target-ensemble path, but it is not yet a standalone service
-- live agent integration now exists for all current click families, but it is still gated and only takes over when the target ensemble returns a decisive, constraint-compatible auto-execute result
-- debug output exists, but not yet at the full artifact granularity originally requested
-- harness exists and a one-command verifier exists, but there is not yet a full benchmark/eval suite for every stage
-
-### Not done yet
-
-- real model integration for:
+- added standalone `candidate-graph-api` with `/health`, `/infer`, `/infer/debug`, and `/admin/selftest`
+- added configurable real-backend routing for model sidecars via `MODEL_BACKEND=http_proxy` and `REMOTE_MODEL_URL`
+- added `.env.ui-vision.example` for real backend wiring
+- added a new optional `ui-vision-real` compose profile with heavyweight local runtime services for:
   - OmniParser V2
   - PaddleOCR-VL-1.5
   - Surya
   - GroundNext-7B
   - Aria-UI
   - Phi-Ground
-- standalone candidate graph service with independent `/health` and `/infer`-style verification
-- live agent integration for all click families
+- added `.env.ui-vision.real.example` for local runtime bring-up
+
+### Partially done
+
+- OCR ensemble fan-out and merge exists and is now verified with live `ppocr`, but it still returns merged OCR words/lines rather than a full interactable graph
+- target ensemble now includes threshold, margin, agreement gating, repair crop reruns, and a final validator stage
+- candidate graph building exists as both a shared library and a standalone service; the agent and harness can now consume the standalone HTTP service directly with local fallbacks
+- the stack can now route model sidecars to real remote backends over HTTP, and there is now an initial local-runtime compose profile for the actual upstream models, but the current wrapper `*-api` services are still the stable integration surface
+- `omniparser-runtime` is now running locally and `omniparser-api` can call it through a new `MODEL_BACKEND=omniparser_runtime` adapter that converts `/parse/` output into the repo's boxed OCR schema
+- `paddleocr-vl-runtime` is now running locally and `paddleocr-vl-api` can call it through a new `MODEL_BACKEND=paddleocr_vl_runtime` adapter that converts `Spotting:` output with `<|LOC_...|>` tokens into the repo's boxed OCR schema
+- `surya-runtime` is now running locally and `surya-api` can call it through a new `MODEL_BACKEND=surya_runtime` adapter that converts `text_lines` output into the repo's boxed OCR schema
+- `ocr-ensemble-api` has now been re-verified with the real local `omniparser-api`, `paddleocr-vl-api`, and `surya-api` wrappers active alongside `ppocr`
+- live agent integration now exists for all current click families, but it is still gated and only takes over when the target ensemble returns a decisive, constraint-compatible auto-execute result
+- debug output exists, but not yet at the full artifact granularity originally requested
+- harness exists and a one-command verifier exists, but there is not yet a full benchmark/eval suite for every stage
+
+### Not done yet
+
+- adapter-level integration from the remaining new local runtime containers into the existing wrapper `/ocr` and `/infer` contracts
+- verification that the new local runtime containers all boot cleanly on this specific machine and GPU setup
 - robust benchmark runs over larger real corpora
 
 ## Safe Verification Plan
@@ -479,6 +497,7 @@ What is plausible but not fully proven from this audit:
   - model service
   - OCR ensemble
   - target ensemble
+- bring up `ui-vision-real` one service at a time, starting with `omniparser-runtime` and `paddleocr-vl-runtime`
 - keep `ocr-api` isolated until it has a known-good health and single-request verification path
 
 ### Before integration into the live clicker
@@ -491,5 +510,5 @@ What is plausible but not fully proven from this audit:
 
 - confirm whether `ocr-api` can survive a clean isolated startup after the reboot
 - verify `ocr-ensemble-api` against live `ocr-api`
-- integrate real backends instead of mocks
+- wire the new local runtime containers into the stable wrapper `*-api` services
 - build the full candidate graph and repair loop

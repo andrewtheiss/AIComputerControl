@@ -52,11 +52,39 @@ def build_candidates(ui_elements: Iterable[Dict[str, Any]], limit: int = 80) -> 
     return shared_build_candidates(ui_elements, limit=limit)
 
 
-def build_candidate_graph_for_payload(payload: Dict[str, Any], candidate_limit: int = 80) -> List[Dict[str, Any]]:
+def _candidate_graph_endpoint(cli_value: str = "") -> str:
+    return str(cli_value or os.environ.get("CANDIDATE_GRAPH_API_URL", "") or "").strip()
+
+
+def _build_candidate_graph_via_service(
+    payload: Dict[str, Any],
+    candidate_limit: int,
+    endpoint: str,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    response = post_json(
+        endpoint,
+        {
+            "ui_elements": list(payload.get("ui_elements") or []),
+            "limit": int(candidate_limit or 80),
+            "viewport": None,
+        },
+    )
+    return list(response.get("candidate_graph") or []), list(response.get("candidates") or [])
+
+
+def build_candidate_graph_for_payload(
+    payload: Dict[str, Any],
+    candidate_limit: int = 80,
+    endpoint: str = "",
+) -> List[Dict[str, Any]]:
     viewport = None
     screenshot_path = str(payload.get("screenshot_path", "") or "").strip()
     if screenshot_path:
         _ = screenshot_path
+    endpoint = _candidate_graph_endpoint(endpoint)
+    if endpoint:
+        candidate_graph, _ = _build_candidate_graph_via_service(payload, candidate_limit=candidate_limit, endpoint=endpoint)
+        return candidate_graph
     return build_candidate_graph(payload.get("ui_elements") or [], limit=candidate_limit, viewport=viewport)
 
 
@@ -143,14 +171,25 @@ def replay_ocr(dumps_dir: Path, endpoint: str, out_dir: Path, limit: int) -> int
     return 0
 
 
-def replay_targets(dumps_dir: Path, endpoint: str, out_dir: Path, limit: int, candidate_limit: int) -> int:
+def replay_targets(
+    dumps_dir: Path,
+    endpoint: str,
+    out_dir: Path,
+    limit: int,
+    candidate_limit: int,
+    candidate_graph_endpoint: str = "",
+) -> int:
     rows: List[Dict[str, Any]] = []
+    candidate_graph_endpoint = _candidate_graph_endpoint(candidate_graph_endpoint)
     for path, payload in iter_planner_dumps(dumps_dir):
         if len(rows) >= limit:
             break
         shot = load_screenshot_b64(path, payload)
-        candidate_graph = build_candidate_graph(payload.get("ui_elements") or [], limit=candidate_limit)
-        candidates = shared_build_candidates(payload.get("ui_elements") or [], limit=candidate_limit)
+        if candidate_graph_endpoint:
+            candidate_graph, candidates = _build_candidate_graph_via_service(payload, candidate_limit=candidate_limit, endpoint=candidate_graph_endpoint)
+        else:
+            candidate_graph = build_candidate_graph(payload.get("ui_elements") or [], limit=candidate_limit)
+            candidates = shared_build_candidates(payload.get("ui_elements") or [], limit=candidate_limit)
         if not shot or not candidates:
             continue
         request_payload = {
@@ -183,11 +222,18 @@ def replay_targets(dumps_dir: Path, endpoint: str, out_dir: Path, limit: int, ca
     return 0
 
 
-def export_corpus(dumps_dir: Path, out_dir: Path, limit: int, candidate_limit: int) -> int:
+def export_corpus(
+    dumps_dir: Path,
+    out_dir: Path,
+    limit: int,
+    candidate_limit: int,
+    candidate_graph_endpoint: str = "",
+) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     rows: List[Dict[str, Any]] = []
     screenshot_dir = out_dir / "screenshots"
     screenshot_dir.mkdir(parents=True, exist_ok=True)
+    candidate_graph_endpoint = _candidate_graph_endpoint(candidate_graph_endpoint)
     for path, payload in iter_planner_dumps(dumps_dir):
         if len(rows) >= limit:
             break
@@ -205,7 +251,11 @@ def export_corpus(dumps_dir: Path, out_dir: Path, limit: int, candidate_limit: i
                 "goal": payload.get("goal", ""),
                 "instruction": derive_instruction(payload),
                 "screenshot_path": str(screenshot_path),
-                "candidate_count": len(shared_build_candidates(payload.get("ui_elements") or [], limit=candidate_limit)),
+                "candidate_count": len(
+                    _build_candidate_graph_via_service(payload, candidate_limit=candidate_limit, endpoint=candidate_graph_endpoint)[1]
+                    if candidate_graph_endpoint
+                    else shared_build_candidates(payload.get("ui_elements") or [], limit=candidate_limit)
+                ),
             }
         )
     write_jsonl(out_dir / "corpus.jsonl", rows)
@@ -220,13 +270,20 @@ def main(argv: List[str]) -> int:
     parser.add_argument("--out-dir", default="artifacts/ui-vision-harness")
     parser.add_argument("--limit", type=int, default=50)
     parser.add_argument("--candidate-limit", type=int, default=80)
+    parser.add_argument("--candidate-graph-endpoint", default=os.environ.get("CANDIDATE_GRAPH_API_URL", ""))
     args = parser.parse_args(argv)
 
     dumps_dir = Path(args.dumps_dir)
     out_dir = Path(args.out_dir)
 
     if args.command == "export-corpus":
-        return export_corpus(dumps_dir, out_dir, limit=args.limit, candidate_limit=args.candidate_limit)
+        return export_corpus(
+            dumps_dir,
+            out_dir,
+            limit=args.limit,
+            candidate_limit=args.candidate_limit,
+            candidate_graph_endpoint=args.candidate_graph_endpoint,
+        )
     if args.command == "replay-ocr":
         if not args.endpoint:
             raise SystemExit("--endpoint is required for replay-ocr")
@@ -234,7 +291,14 @@ def main(argv: List[str]) -> int:
     if args.command == "replay-targets":
         if not args.endpoint:
             raise SystemExit("--endpoint is required for replay-targets")
-        return replay_targets(dumps_dir, args.endpoint, out_dir, limit=args.limit, candidate_limit=args.candidate_limit)
+        return replay_targets(
+            dumps_dir,
+            args.endpoint,
+            out_dir,
+            limit=args.limit,
+            candidate_limit=args.candidate_limit,
+            candidate_graph_endpoint=args.candidate_graph_endpoint,
+        )
     raise SystemExit(f"Unsupported command: {args.command}")
 
 

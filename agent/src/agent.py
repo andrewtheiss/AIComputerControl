@@ -58,6 +58,7 @@ POST_ACTION_VERIFY_STABLE_HITS = max(1, int(os.environ.get("POST_ACTION_VERIFY_S
 NOOP_SIMILARITY_THRESHOLD = float(os.environ.get("AGENT_NOOP_SIMILARITY_THRESHOLD", "0.985"))
 A11Y_BRIDGE_URL = os.environ.get("A11Y_BRIDGE_URL", "").strip()
 A11Y_FETCH_TIMEOUT_S = float(os.environ.get("A11Y_FETCH_TIMEOUT_S", "0.45"))
+CANDIDATE_GRAPH_API_URL = os.environ.get("CANDIDATE_GRAPH_API_URL", "").strip()
 TARGET_ENSEMBLE_API_URL = os.environ.get("TARGET_ENSEMBLE_API_URL", "").strip()
 TARGET_ENSEMBLE_SHADOW_MODE = os.environ.get("TARGET_ENSEMBLE_SHADOW_MODE", "0") == "1"
 TARGET_ENSEMBLE_SHADOW_TOP_K = max(1, min(10, int(os.environ.get("TARGET_ENSEMBLE_SHADOW_TOP_K", "5"))))
@@ -3406,6 +3407,36 @@ document.addEventListener('keydown',function(e){{
     def _build_target_ensemble_candidates(self, ui_elements: List[Dict[str, Any]], limit: int = 80) -> List[Dict[str, Any]]:
         viewport_w = int(self.last_img.shape[1]) if self.last_img is not None else 1000
         viewport_h = int(self.last_img.shape[0]) if self.last_img is not None else 1000
+        if CANDIDATE_GRAPH_API_URL:
+            try:
+                _base = CANDIDATE_GRAPH_API_URL.rstrip("/")
+                if _base.endswith("/infer/debug"):
+                    _base = _base[: -len("/infer/debug")]
+                elif _base.endswith("/infer"):
+                    _base = _base[: -len("/infer")]
+                endpoint = _base + ("/infer/debug" if self.trace_enabled and TARGET_ENSEMBLE_SHADOW_DEBUG else "/infer")
+                resp = self.session.post(
+                    endpoint,
+                    json={
+                        "ui_elements": list(ui_elements[:limit]),
+                        "limit": limit,
+                        "viewport": {"width": viewport_w, "height": viewport_h},
+                        "debug": bool(self.trace_enabled and TARGET_ENSEMBLE_SHADOW_DEBUG),
+                    },
+                    timeout=(2.0, 8.0),
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                remote_candidates = list(data.get("candidates") or [])
+                if remote_candidates:
+                    self._log(
+                        "info",
+                        "candidate_graph.remote",
+                        {"candidate_count": len(remote_candidates), "graph_count": len(data.get("candidate_graph") or [])},
+                    )
+                    return remote_candidates
+            except Exception as e:
+                self._log("warn", "candidate_graph.remote_failed", {"error": str(e)})
         groups: List[Dict[str, Any]] = []
         for element in ui_elements[:limit]:
             box = element.get("box") or [0, 0, 0, 0]

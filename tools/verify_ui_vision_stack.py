@@ -15,7 +15,9 @@ from typing import Iterable, List
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TEST_IMAGE = REPO_ROOT / "texty_image.png"
 SAFE_TESTS = [
+    "tests.test_candidate_graph_service",
     "tests.test_model_service",
+    "tests.test_model_service_providers",
     "tests.test_ocr_ensemble",
     "tests.test_target_ensemble",
     "tests.test_ui_vision_harness",
@@ -115,6 +117,20 @@ def verify_mock_grounding() -> None:
         stop_services(services)
 
 
+def verify_candidate_graph() -> None:
+    print_step("Candidate Graph Service")
+    services = ["candidate-graph-api"]
+    start_services(services, profile="ui-vision")
+    try:
+        print(json.dumps(wait_for_url("http://127.0.0.1:28125/health"), indent=2))
+        body = post_json("http://127.0.0.1:28125/admin/selftest", {})
+        if int((body.get("checks") or {}).get("graph_count", 0)) <= 0:
+            raise RuntimeError("Candidate graph selftest returned no graph entries")
+        print(json.dumps(body, indent=2))
+    finally:
+        stop_services(services)
+
+
 def verify_mock_ocr() -> None:
     print_step("Mock OCR Stack")
     services = ["omniparser-api", "paddleocr-vl-api", "surya-api"]
@@ -205,6 +221,7 @@ def main(argv: List[str]) -> int:
     args = parser.parse_args(argv)
 
     verify_safe_tests()
+    verify_candidate_graph()
     verify_mock_grounding()
     verify_mock_ocr()
     if not args.skip_real_ocr:

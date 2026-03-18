@@ -32,7 +32,8 @@ services:
     environment:
       MODEL_ID: omniparser
       MODEL_ROLE: ocr
-      MODEL_BACKEND: mock
+      MODEL_BACKEND: ${OMNIPARSER_MODEL_BACKEND:-mock}
+      REMOTE_MODEL_URL: ${OMNIPARSER_REMOTE_MODEL_URL:-}
       DEBUG_ARTIFACT_DIR: /tmp/ui-model-debug
     ports:
       - "28101:8000"
@@ -49,7 +50,8 @@ services:
     environment:
       MODEL_ID: paddleocr-vl
       MODEL_ROLE: ocr
-      MODEL_BACKEND: mock
+      MODEL_BACKEND: ${PADDLEOCR_VL_MODEL_BACKEND:-mock}
+      REMOTE_MODEL_URL: ${PADDLEOCR_VL_REMOTE_MODEL_URL:-}
       DEBUG_ARTIFACT_DIR: /tmp/ui-model-debug
     ports:
       - "28102:8000"
@@ -66,7 +68,8 @@ services:
     environment:
       MODEL_ID: surya
       MODEL_ROLE: ocr
-      MODEL_BACKEND: mock
+      MODEL_BACKEND: ${SURYA_MODEL_BACKEND:-mock}
+      REMOTE_MODEL_URL: ${SURYA_REMOTE_MODEL_URL:-}
       DEBUG_ARTIFACT_DIR: /tmp/ui-model-debug
     ports:
       - "28103:8000"
@@ -83,7 +86,8 @@ services:
     environment:
       MODEL_ID: groundnext
       MODEL_ROLE: grounding
-      MODEL_BACKEND: mock
+      MODEL_BACKEND: ${GROUNDNEXT_MODEL_BACKEND:-mock}
+      REMOTE_MODEL_URL: ${GROUNDNEXT_REMOTE_MODEL_URL:-}
       DEBUG_ARTIFACT_DIR: /tmp/ui-model-debug
     ports:
       - "28111:8000"
@@ -100,7 +104,8 @@ services:
     environment:
       MODEL_ID: aria-ui
       MODEL_ROLE: grounding
-      MODEL_BACKEND: mock
+      MODEL_BACKEND: ${ARIA_UI_MODEL_BACKEND:-mock}
+      REMOTE_MODEL_URL: ${ARIA_UI_REMOTE_MODEL_URL:-}
       DEBUG_ARTIFACT_DIR: /tmp/ui-model-debug
     ports:
       - "28112:8000"
@@ -117,12 +122,160 @@ services:
     environment:
       MODEL_ID: phi-ground
       MODEL_ROLE: grounding
-      MODEL_BACKEND: mock
+      MODEL_BACKEND: ${PHI_GROUND_MODEL_BACKEND:-mock}
+      REMOTE_MODEL_URL: ${PHI_GROUND_REMOTE_MODEL_URL:-}
       DEBUG_ARTIFACT_DIR: /tmp/ui-model-debug
     ports:
       - "28113:8000"
     volumes:
       - ./ui-model-debug:/tmp/ui-model-debug:rw
+    networks: ["ai-net"]
+
+  omniparser-runtime:
+    profiles: ["ui-vision-real"]
+    image: ai-ui-runtime-omniparser:latest
+    pull_policy: never
+    entrypoint: ["bash", "/usr/local/bin/start-omniparser"]
+    environment:
+      HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-}
+      HF_HOME: /root/.cache/huggingface
+      TRANSFORMERS_CACHE: /root/.cache/huggingface
+      OMNIPARSER_MODEL_ID: ${OMNIPARSER_RUNTIME_MODEL_ID:-microsoft/OmniParser-v2.0}
+      OMNIPARSER_DEVICE: ${OMNIPARSER_RUNTIME_DEVICE:-cuda}
+      OMNIPARSER_BOX_THRESHOLD: ${OMNIPARSER_RUNTIME_BOX_THRESHOLD:-0.05}
+      CUDA_VISIBLE_DEVICES: ${OMNIPARSER_RUNTIME_VISIBLE_GPU:-0}
+      NVIDIA_VISIBLE_DEVICES: ${OMNIPARSER_RUNTIME_VISIBLE_GPU:-0}
+    ports:
+      - "29001:8000"
+    volumes:
+      - ./realModels/omniparser/start.sh:/usr/local/bin/start-omniparser:ro
+      - hf_cache:/root/.cache/huggingface
+      - omniparser_weights:/opt/OmniParser/weights
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+    networks: ["ai-net"]
+
+  paddleocr-vl-runtime:
+    profiles: ["ui-vision-real"]
+    image: ${PADDLEOCR_VL_RUNTIME_IMAGE:-ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-genai-vllm-server:latest-nvidia-gpu}
+    user: "0:0"
+    command: >-
+      paddleocr genai_server
+      --model_name ${PADDLEOCR_VL_RUNTIME_MODEL_NAME:-PaddleOCR-VL-1.5-0.9B}
+      --host 0.0.0.0
+      --port 8080
+      --backend ${PADDLEOCR_VL_RUNTIME_BACKEND:-vllm}
+    environment:
+      HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-}
+      HF_HOME: /root/.cache/huggingface
+      TRANSFORMERS_CACHE: /root/.cache/huggingface
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
+    ports:
+      - "29002:8080"
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+    networks: ["ai-net"]
+
+  surya-runtime:
+    profiles: ["ui-vision-real"]
+    image: ${SURYA_RUNTIME_IMAGE:-quay.io/wener/surya-ocr:latest}
+    environment:
+      HF_HOME: /root/.cache/huggingface
+      TRANSFORMERS_CACHE: /root/.cache/huggingface
+    ports:
+      - "29003:3000"
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    networks: ["ai-net"]
+
+  groundnext-runtime:
+    profiles: ["ui-vision-real"]
+    image: ${VLLM_RUNTIME_IMAGE:-vllm/vllm-openai:latest}
+    command: >-
+      --model ${GROUNDNEXT_RUNTIME_MODEL_ID:-ServiceNow/GroundNext-7B-V0}
+      --served-model-name groundnext
+      --host 0.0.0.0
+      --port 8000
+      --trust-remote-code
+      --dtype ${GROUNDNEXT_RUNTIME_DTYPE:-bfloat16}
+    environment:
+      HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-}
+      HF_HOME: /root/.cache/huggingface
+      TRANSFORMERS_CACHE: /root/.cache/huggingface
+      NVIDIA_VISIBLE_DEVICES: ${UI_VISION_REAL_VISIBLE_GPUS:-all}
+    ports:
+      - "29111:8000"
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+    networks: ["ai-net"]
+
+  aria-ui-runtime:
+    profiles: ["ui-vision-real"]
+    image: ${VLLM_RUNTIME_IMAGE:-vllm/vllm-openai:latest}
+    command: >-
+      --model ${ARIA_UI_RUNTIME_MODEL_ID:-Aria-UI/Aria-UI-base}
+      --served-model-name aria-ui
+      --host 0.0.0.0
+      --port 8000
+      --trust-remote-code
+      --tokenizer-mode slow
+      --dtype ${ARIA_UI_RUNTIME_DTYPE:-bfloat16}
+    environment:
+      HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-}
+      HF_HOME: /root/.cache/huggingface
+      TRANSFORMERS_CACHE: /root/.cache/huggingface
+      NVIDIA_VISIBLE_DEVICES: ${UI_VISION_REAL_VISIBLE_GPUS:-all}
+    ports:
+      - "29112:8000"
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+    networks: ["ai-net"]
+
+  phi-ground-runtime:
+    profiles: ["ui-vision-real"]
+    image: ${VLLM_RUNTIME_IMAGE:-vllm/vllm-openai:latest}
+    command: >-
+      --model ${PHI_GROUND_RUNTIME_MODEL_ID:-microsoft/Phi-Ground}
+      --served-model-name phi-ground
+      --host 0.0.0.0
+      --port 8000
+      --trust-remote-code
+      --dtype ${PHI_GROUND_RUNTIME_DTYPE:-bfloat16}
+    environment:
+      HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-}
+      HF_HOME: /root/.cache/huggingface
+      TRANSFORMERS_CACHE: /root/.cache/huggingface
+      NVIDIA_VISIBLE_DEVICES: ${UI_VISION_REAL_VISIBLE_GPUS:-all}
+    ports:
+      - "29113:8000"
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
     networks: ["ai-net"]
 
   ocr-ensemble-api:
@@ -144,6 +297,20 @@ services:
       - omniparser-api
       - paddleocr-vl-api
       - surya-api
+    networks: ["ai-net"]
+
+  candidate-graph-api:
+    profiles: ["ui-vision"]
+    build:
+      context: .
+      dockerfile: candidateGraph/Dockerfile
+    image: ai-candidate-graph
+    environment:
+      DEBUG_ARTIFACT_DIR: /tmp/candidate-graph-debug
+    ports:
+      - "28125:8000"
+    volumes:
+      - ./candidate-graph-debug:/tmp/candidate-graph-debug:rw
     networks: ["ai-net"]
 
   target-ensemble-api:
@@ -192,6 +359,7 @@ services:
       - ai-net            
 
   vnc-instance-1:
+    profiles: ["ui-vision"]
     image: ai-sandbox
     build:
       context: ./agent          # <- folder that contains the Dockerfile you pasted
@@ -215,6 +383,7 @@ services:
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
       TASK_PLANNER_URL: http://task-planner:8000/v1/actions/next
       PLANNER_API_KEY: taskPlannerApiSecret
+      CANDIDATE_GRAPH_API_URL: http://candidate-graph-api:8000/infer
       TARGET_ENSEMBLE_API_URL: http://target-ensemble-api:8000/infer
       TARGET_ENSEMBLE_SHADOW_MODE: "1"
       TARGET_ENSEMBLE_SHADOW_DEBUG: "1"
@@ -230,10 +399,12 @@ services:
       - rtdetr-api
       - task-planner
       - ocr-api
+      - candidate-graph-api
     networks:
       - ai-net
 
   vnc-instance-2:
+    profiles: ["ui-vision"]
     image: ai-sandbox
     container_name: vnc-instance-2
     ports:
@@ -253,6 +424,7 @@ services:
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
       TASK_PLANNER_URL: http://task-planner:8000/v1/actions/next
       PLANNER_API_KEY: taskPlannerApiSecret
+      CANDIDATE_GRAPH_API_URL: http://candidate-graph-api:8000/infer
       TARGET_ENSEMBLE_API_URL: http://target-ensemble-api:8000/infer
       TARGET_ENSEMBLE_SHADOW_MODE: "1"
       TARGET_ENSEMBLE_SHADOW_DEBUG: "1"
@@ -267,6 +439,7 @@ services:
       - rtdetr-api
       - task-planner
       - ocr-api
+      - candidate-graph-api
     networks:
       - ai-net
 
@@ -301,3 +474,5 @@ volumes:
   agent1_cache:
   agent2_mozilla:
   agent2_cache:
+  hf_cache:
+  omniparser_weights:

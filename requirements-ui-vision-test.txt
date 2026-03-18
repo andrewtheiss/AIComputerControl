@@ -1,4 +1,5 @@
 -r modelService/requirements.txt
+-r candidateGraph/requirements.txt
 -r ocrEnsemble/requirements.txt
 -r targetEnsemble/requirements.txt
 httpx

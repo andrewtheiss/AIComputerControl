@@ -11,5 +11,6 @@ artifacts/
 ocr-ensemble-debug/
 target-ensemble-debug/
 ui-model-debug/
+candidate-graph-debug/
 
 __pycache__/

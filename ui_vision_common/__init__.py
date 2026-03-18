@@ -1,6 +1,8 @@
 from .candidate_graph import build_candidate_graph, build_candidates, candidate_graph_to_candidates, infer_allowed_actions
 from .schemas import (
     Candidate,
+    CandidateGraphRequest,
+    CandidateGraphResponse,
     GroundingRequest,
     GroundingResponse,
     OCRBox,
@@ -14,6 +16,8 @@ __all__ = [
     "build_candidates",
     "candidate_graph_to_candidates",
     "Candidate",
+    "CandidateGraphRequest",
+    "CandidateGraphResponse",
     "GroundingRequest",
     "GroundingResponse",
     "infer_allowed_actions",

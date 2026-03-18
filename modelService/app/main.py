@@ -105,6 +105,7 @@ def create_app() -> FastAPI:
                 model_id=model_id,
                 backend=backend,
                 latency_ms=int(result.get("latency_ms") or 0),
+                meta=dict(result.get("meta") or {}),
             )
             if req.debug:
                 response.debug_artifacts = _save_ocr_debug(image_bgr, response)
@@ -130,6 +131,7 @@ def create_app() -> FastAPI:
                 backend=backend,
                 predictions=list(result.get("predictions") or []),
                 latency_ms=int(result.get("latency_ms") or 0),
+                meta=dict(result.get("meta") or {}),
             )
             if payload.debug:
                 response.debug_artifacts = _save_grounding_debug(image_bgr, payload, response)

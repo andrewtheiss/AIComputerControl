@@ -45,6 +45,24 @@ class Candidate(BaseModel):
     extras: Dict[str, Any] = Field(default_factory=dict)
 
 
+class CandidateGraphRequest(BaseModel):
+    ui_elements: List[Dict[str, Any]] = Field(default_factory=list)
+    limit: int = 80
+    viewport: Optional[Dict[str, int]] = None
+    screenshot_b64: Optional[str] = None
+    debug: bool = False
+
+
+class CandidateGraphResponse(BaseModel):
+    model_id: str
+    backend: str
+    candidate_graph: List[Dict[str, Any]] = Field(default_factory=list)
+    candidates: List[Candidate] = Field(default_factory=list)
+    latency_ms: Optional[int] = None
+    debug_artifacts: Dict[str, str] = Field(default_factory=dict)
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+
 class GroundingRequest(BaseModel):
     instruction: str
     history: List[str] = Field(default_factory=list)

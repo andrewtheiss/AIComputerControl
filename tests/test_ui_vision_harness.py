@@ -1,6 +1,7 @@
 import unittest
+from unittest.mock import patch
 
-from tools.ui_vision_harness import build_candidates, derive_instruction, infer_allowed_actions
+from tools.ui_vision_harness import build_candidate_graph_for_payload, build_candidates, derive_instruction, infer_allowed_actions
 from ui_vision_common.candidate_graph import build_candidate_graph
 
 
@@ -49,6 +50,20 @@ class UIVisionHarnessTest(unittest.TestCase):
         self.assertEqual(graph[0]["role_hint"], "button")
         self.assertIn("ax", graph[0]["source_mask"])
         self.assertIn("ocr_word", graph[0]["source_mask"])
+
+    def test_build_candidate_graph_for_payload_can_use_service(self):
+        with patch("tools.ui_vision_harness.post_json") as mock_post:
+            mock_post.return_value = {
+                "candidate_graph": [{"id": "C001", "text": "Sign in"}],
+                "candidates": [{"id": "C001", "box": [1, 2, 3, 4], "text": "Sign in"}],
+            }
+            graph = build_candidate_graph_for_payload(
+                {"ui_elements": [{"text": "Sign in", "box": [1, 2, 3, 4]}]},
+                candidate_limit=10,
+                endpoint="http://candidate-graph-api:8000/infer",
+            )
+        self.assertEqual(graph[0]["id"], "C001")
+        mock_post.assert_called_once()
 
 
 if __name__ == "__main__":
