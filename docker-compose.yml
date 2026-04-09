@@ -15,7 +15,11 @@ services:
       - PP_OCR_DET_SIDE=1280
       - PP_OCR_MODEL=ppocrv5_server
       - UVICORN_WORKERS=1
-      
+    # Expose on the host for standalone smoke tests (tools/ocr_smoke.py, curl).
+    # Inside the compose network, other services still reach it by name as
+    # http://ocr-api:8020 — the host mapping is debug-only.
+    ports:
+      - "28020:8020"
     deploy:
       resources:
         reservations:
@@ -300,6 +304,13 @@ services:
     image: ai-ocr-ensemble
     environment:
       DEBUG_ARTIFACT_DIR: /tmp/ocr-ensemble-debug
+      # Drop mock-backed upstream responses from the merged output. Mock
+      # sidecars (MODEL_BACKEND=mock) still appear in per_model.json for
+      # debug visibility, but their placeholder text (Browser, Sign in,
+      # Continue) is excluded from the merged words/lines the agent
+      # consumes. Set to "0" only when intentionally testing mock-only
+      # fan-out behavior.
+      OCR_ENSEMBLE_DROP_MOCK_BACKEND: "1"
       OCR_ENSEMBLE_MODEL_URLS: >-
         {"ppocr":"http://ocr-api:8020/ocr","omniparser":"http://omniparser-api:8000/ocr","paddleocr-vl":"http://paddleocr-vl-api:8000/ocr","surya":"http://surya-api:8000/ocr"}
     ports:
@@ -397,6 +408,12 @@ services:
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
       TASK_PLANNER_URL: http://task-planner:8000/v1/actions/next
       PLANNER_API_KEY: taskPlannerApiSecret
+      # Route the agent's OCR capture through the ensemble aggregator so every
+      # configured OCR ingredient (ppocr + omniparser + paddleocr-vl + surya)
+      # feeds the decision-making state snapshot, not just legacy ppocr. The
+      # ensemble speaks the same OCRResponse schema as ocr-api, so OCRClient
+      # is drop-in compatible.
+      OCR_API_URL: http://ocr-ensemble-api:8000/ocr
       CANDIDATE_GRAPH_API_URL: http://candidate-graph-api:8000/infer
       TARGET_ENSEMBLE_API_URL: http://target-ensemble-api:8000/infer
       TARGET_ENSEMBLE_SHADOW_MODE: "1"
@@ -413,7 +430,9 @@ services:
       - rtdetr-api
       - task-planner
       - ocr-api
+      - ocr-ensemble-api
       - candidate-graph-api
+      - target-ensemble-api
     networks:
       - ai-net
 
@@ -438,6 +457,8 @@ services:
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
       TASK_PLANNER_URL: http://task-planner:8000/v1/actions/next
       PLANNER_API_KEY: taskPlannerApiSecret
+      # Route OCR capture through the ensemble aggregator — see vnc-instance-1.
+      OCR_API_URL: http://ocr-ensemble-api:8000/ocr
       CANDIDATE_GRAPH_API_URL: http://candidate-graph-api:8000/infer
       TARGET_ENSEMBLE_API_URL: http://target-ensemble-api:8000/infer
       TARGET_ENSEMBLE_SHADOW_MODE: "1"
@@ -453,7 +474,9 @@ services:
       - rtdetr-api
       - task-planner
       - ocr-api
+      - ocr-ensemble-api
       - candidate-graph-api
+      - target-ensemble-api
     networks:
       - ai-net
 
@@ -469,7 +492,7 @@ services:
     environment:
       PLANNER_API_KEY: taskPlannerApiSecret
       OLLAMA_OPENAI_BASE: http://host.docker.internal:1234/v1
-      OLLAMA_MODEL: qwen3.5
+      OLLAMA_MODEL: gemma-4-31b-it
       PLANNER_LOG_REQUESTS: "1"
       PLANNER_DUMP_REQUESTS_DIR: "/dumps"
       PLANNER_DUMP_MAX_FILES: "200"

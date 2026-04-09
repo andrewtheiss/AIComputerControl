@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(chmod +x /home/theiss/AIComputerControl/tools/ocr_smoke.py)",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('/home/theiss/AIComputerControl/tools/ocr_smoke.py'\\).read\\(\\)\\); print\\('ocr_smoke.py parses OK'\\)\")",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('/home/theiss/AIComputerControl/agent/src/ocr_client.py'\\).read\\(\\)\\); print\\('ocr_client.py parses OK'\\)\")",
+      "Bash(python3 -c \"import yaml; d=yaml.safe_load\\(open\\('/home/theiss/AIComputerControl/docker-compose.yml'\\)\\); print\\('services:', len\\(d['services']\\)\\)\")",
+      "Bash(docker compose:*)",
+      "Bash(python3:*)",
+      "Bash(.venv-ui-vision/bin/python -m unittest tests.test_ocr_ensemble.OCREnsembleDropMockTest -v)",
+      "Bash(.venv-ui-vision/bin/python -c \"from ocrEnsemble.app.main import create_app; app = create_app\\(\\); print\\('loaded', type\\(app\\).__name__\\)\")",
+      "Bash(.venv-ui-vision/bin/python -m unittest tests.test_model_service -v)",
+      "Bash(pkill -f test_ocr_ensemble)",
+      "Bash(pkill -f unittest)",
+      "Bash(.venv-ui-vision/bin/python -c ':*)",
+      "Bash(.venv-ui-vision/bin/python -m unittest tests.test_target_ensemble_shadow_utils tests.test_ui_vision_harness tests.test_model_service_providers tests.test_target_ensemble -v)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(.venv-ui-vision/bin/python -m unittest tests.test_ocr_ensemble.OCREnsembleDropMockTest tests.test_target_ensemble tests.test_target_ensemble_shadow_utils tests.test_ui_vision_harness tests.test_model_service_providers)"
+    ]
+  }
+}

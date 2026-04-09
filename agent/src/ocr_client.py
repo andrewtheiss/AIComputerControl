@@ -1,8 +1,12 @@
+import logging
 from typing import Any, Dict, List, Optional
 
 import cv2
 import numpy as np
 import requests
+
+
+_logger = logging.getLogger("agent.ocr")
 
 
 def _poly_to_box(poly: Any) -> Optional[List[int]]:
@@ -57,18 +61,27 @@ class OCRClient:
     def __init__(self, url: Optional[str] = None, min_score: float = 0.45):
         self.url = (url or "").strip()
         self.min_score = float(min_score)
+        # Tag the HTTP source so traces can distinguish ppocr-direct from the
+        # fan-out ensemble at a glance, without grepping URL strings.
+        url_lower = self.url.lower()
+        if "ensemble" in url_lower:
+            self._http_source = "ensemble_http"
+        elif self.url:
+            self._http_source = "http"
+        else:
+            self._http_source = ""
 
     def ocr(self, bgr_img: np.ndarray) -> List[Dict[str, Any]]:
         return self.ocr_levels(bgr_img).get("words", [])
 
     def ocr_levels(self, bgr_img: np.ndarray) -> Dict[str, Any]:
         if not self.url:
-            return self._tesseract_fallback_levels(bgr_img)
+            return self._tesseract_fallback_levels(bgr_img, reason="no_url")
 
         # OCR targeting is sensitive to compression artifacts, so prefer PNG.
         ok, buf = cv2.imencode(".png", bgr_img, [int(cv2.IMWRITE_PNG_COMPRESSION), 3])
         if not ok:
-            return self._tesseract_fallback_levels(bgr_img)
+            return self._tesseract_fallback_levels(bgr_img, reason="png_encode_failed")
 
         try:
             r = requests.post(
@@ -78,15 +91,20 @@ class OCRClient:
             )
             r.raise_for_status()
             j = r.json()
-        except Exception:
-            # Fallback to local Tesseract if HTTP fails
-            return self._tesseract_fallback_levels(bgr_img)
+        except Exception as exc:
+            # Fallback to local Tesseract if HTTP fails. Log a warning so the
+            # operator can see degraded-mode events in the agent logs — this
+            # used to be silent and made the trace impossible to diagnose.
+            return self._tesseract_fallback_levels(
+                bgr_img,
+                reason=f"http_error:{type(exc).__name__}",
+            )
 
         words = self._normalize_api_items(j.get("words", []) or [], level="word")
         lines = self._normalize_api_items(j.get("lines", []) or [], level="line")
         if words and not lines:
             lines = _group_lines(words)
-        return {"words": words, "lines": lines, "source": "http"}
+        return {"words": words, "lines": lines, "source": self._http_source}
 
     def _normalize_api_items(self, items: List[Dict[str, Any]], level: str) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
@@ -115,11 +133,18 @@ class OCRClient:
         return [item for item in out if item.get("text")]
 
     def _tesseract_fallback(self, bgr_img: np.ndarray) -> List[Dict[str, Any]]:
-        return self._tesseract_fallback_levels(bgr_img).get("words", [])
+        return self._tesseract_fallback_levels(bgr_img, reason="direct_call").get("words", [])
 
-    def _tesseract_fallback_levels(self, bgr_img: np.ndarray) -> Dict[str, Any]:
+    def _tesseract_fallback_levels(self, bgr_img: np.ndarray, reason: str = "unknown") -> Dict[str, Any]:
         # Import here to avoid hard dependency if HTTP is used
         import pytesseract
+
+        if self.url and reason != "direct_call":
+            _logger.warning(
+                "agent.ocr.fallback to tesseract (url=%s reason=%s)",
+                self.url,
+                reason,
+            )
 
         rgb = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB)
         try:

@@ -69,10 +69,10 @@ TARGET_ENSEMBLE_EXECUTION_MODE = os.environ.get("TARGET_ENSEMBLE_EXECUTION_MODE"
 # Optional LLM (OpenAI-compatible or local)
 # Configure one of the following:
 # - LLM_API_URL: Either a full endpoint (…/v1/chat/completions or …/v1/responses) OR the base URL (…/v1)
-# - LLM_MODEL: Target model name (e.g., "qwen3.5" or vendor-specific alias)
+# - LLM_MODEL: Target model name (e.g., "gemma-4-31b-it" or vendor-specific alias)
 # - LLM_API_KEY: Optional bearer token if your server requires it
 LLM_API_URL = os.environ.get("LLM_API_URL", "http://127.0.0.1:1234/v1").strip()
-LLM_MODEL = os.environ.get("LLM_MODEL", "qwen3.5").strip()
+LLM_MODEL = os.environ.get("LLM_MODEL", "gemma-4-31b-it").strip()
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "").strip()
 LLM_API_MODE = os.environ.get("LLM_API_MODE", "auto").strip()  # "auto" | "responses" | "chat"
 

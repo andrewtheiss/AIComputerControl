@@ -41,9 +41,9 @@ DUMP_DIR = os.getenv("PLANNER_DUMP_REQUESTS_DIR", "").strip()
 MAX_DUMPS = int(os.getenv("PLANNER_DUMP_MAX_FILES", "200"))
 
 # --- OpenAI-compatible client (local or remote) ---
-# Point to your server base (e.g., http://127.0.0.1:1234/v1) and model (e.g., qwen3.5)
+# Point to your server base (e.g., http://127.0.0.1:1234/v1) and model (e.g., gemma-4-31b-it)
 OLLAMA_OPENAI_BASE = os.getenv("OLLAMA_OPENAI_BASE", "http://127.0.0.1:1234/v1")
-OLLAMA_MODEL       = os.getenv("OLLAMA_MODEL", "qwen3.5")
+OLLAMA_MODEL       = os.getenv("OLLAMA_MODEL", "gemma-4-31b-it")
 OPENAI_DUMMY_KEY   = os.getenv("OPENAI_API_KEY", "local")  # many local servers ignore the key but SDK requires it
 client = AsyncOpenAI(base_url=OLLAMA_OPENAI_BASE, api_key=OPENAI_DUMMY_KEY)
 

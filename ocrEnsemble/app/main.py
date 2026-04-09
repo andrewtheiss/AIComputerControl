@@ -29,6 +29,30 @@ def _load_model_urls() -> Dict[str, str]:
     return {str(key): str(value) for key, value in json.loads(raw).items()}
 
 
+def _drop_mock_backend_enabled() -> bool:
+    """Whether to exclude mock-backed upstreams from the merged output.
+
+    Default ON. When enabled, responses whose upstream is a mock (either the
+    ensemble's own ``mock://`` scheme, or a modelService sidecar running with
+    MODEL_BACKEND=mock) are kept in ``per_model`` for debug visibility but
+    excluded from the merged ``words`` / ``lines`` and from
+    ``meta.models``. This prevents mock placeholder text ("Browser",
+    "Sign in", "Continue") from polluting the live agent decision path when
+    only a subset of the configured ingredients have real weights available.
+
+    Flip to ``0`` to restore the legacy merge-everything behavior (useful in
+    tests that explicitly exercise mock-only fan-out).
+    """
+    return str(os.environ.get("OCR_ENSEMBLE_DROP_MOCK_BACKEND", "1") or "1").strip().lower() not in ("0", "false", "no", "")
+
+
+def _is_mock_upstream(model_url: str, result: Dict[str, Any]) -> bool:
+    if str(model_url or "").startswith("mock://"):
+        return True
+    backend = str((result or {}).get("backend", "") or "").strip().lower()
+    return backend == "mock"
+
+
 def _normalize_text(text: str) -> str:
     return " ".join((text or "").lower().split())
 
@@ -120,9 +144,111 @@ def _call_model(session: requests.Session, model_id: str, model_url: str, image_
     return resp.json()
 
 
+def execute_ocr_fanout(
+    image_bgr,
+    req: OCRRequest,
+    model_urls: Dict[str, str],
+    drop_mock_backend: bool,
+    session: Optional[requests.Session] = None,
+) -> Dict[str, Any]:
+    """Pure fan-out + merge entry point. No FastAPI, no artifact writing.
+
+    This is the single place where per-upstream results are collected,
+    tagged, and either merged into the final output or dropped as mock.
+    The FastAPI handler wraps this with request decoding + artifact
+    saving; tests can call it directly with a numpy image to exercise the
+    full merge/drop logic without HTTP, subprocess, or ASGI transport.
+
+    Returns the response dict (already shaped like OCRResponse.model_dump()).
+    When ``req.debug`` is truthy, a ``per_model`` dict is attached under
+    ``response["meta"]["per_model"]`` for forensics. Debug artifact files
+    (input.png / overlays / per_model.json) remain the FastAPI layer's
+    concern; callers that want them must attach separately.
+    """
+    t0 = time.perf_counter()
+    image_b64 = encode_png_b64(image_bgr)
+    owns_session = session is None
+    if owns_session:
+        session = requests.Session()
+    try:
+        per_model: Dict[str, Any] = {}
+        all_words: List[Dict[str, Any]] = []
+        all_lines: List[Dict[str, Any]] = []
+        active_models: List[str] = []
+        dropped_mock_models: List[str] = []
+        for model_id, model_url in model_urls.items():
+            try:
+                result = _call_model(
+                    session,
+                    model_id=model_id,
+                    model_url=model_url,
+                    image_b64=image_b64,
+                    min_score=req.min_score,
+                )
+                is_mock = _is_mock_upstream(model_url, result)
+                words_list = list(result.get("words") or [])
+                lines_list = list(result.get("lines") or [])
+                for item in words_list:
+                    item["source_model"] = model_id
+                for item in lines_list:
+                    item["source_model"] = model_id
+                status = "mock_skipped" if (is_mock and drop_mock_backend) else "ok"
+                per_model[model_id] = {
+                    "status": status,
+                    "latency_ms": int(result.get("latency_ms") or 0),
+                    "words": words_list,
+                    "lines": lines_list,
+                    "backend": str(result.get("backend") or ("mock" if is_mock else "")),
+                    "upstream_url": model_url,
+                }
+                if is_mock and drop_mock_backend:
+                    dropped_mock_models.append(model_id)
+                    continue
+                all_words.extend(words_list)
+                all_lines.extend(lines_list)
+                active_models.append(model_id)
+            except Exception as exc:
+                per_model[model_id] = {
+                    "status": "error",
+                    "error": str(exc),
+                    "words": [],
+                    "lines": [],
+                    "upstream_url": model_url,
+                }
+
+        height, width = image_bgr.shape[:2]
+        response = OCRResponse(
+            width=width,
+            height=height,
+            words=_merge_level(all_words),
+            lines=_merge_level(all_lines),
+            model_id="ocr-ensemble",
+            backend="fanout",
+            latency_ms=int((time.perf_counter() - t0) * 1000),
+            meta={
+                "models": list(model_urls.keys()),
+                "active_models": active_models,
+                "dropped_mock_models": dropped_mock_models,
+                "drop_mock_backend": drop_mock_backend,
+                "per_model_status": {key: value["status"] for key, value in per_model.items()},
+            },
+        ).model_dump()
+        if req.return_level == "word":
+            response["lines"] = []
+        elif req.return_level == "line":
+            response["words"] = []
+        if req.debug:
+            response["meta"]["per_model"] = per_model
+        return response
+    finally:
+        if owns_session:
+            session.close()
+
+
 def create_app() -> FastAPI:
     debug_dir = str(os.environ.get("DEBUG_ARTIFACT_DIR", "/tmp/ocr-ensemble-debug") or "/tmp/ocr-ensemble-debug")
     model_urls = _load_model_urls()
+    drop_mock_backend = _drop_mock_backend_enabled()
     session = requests.Session()
     app = FastAPI(title="OCR Ensemble API")
 
@@ -160,47 +286,18 @@ def create_app() -> FastAPI:
         return {"artifact_dir": artifact_dir, "input": raw_path, "overlay": overlay_path, "per_model": per_model_path, "response": response_path}
 
     def _run(image_bgr, req: OCRRequest, force_debug: bool = False) -> Dict[str, Any]:
-        t0 = time.perf_counter()
-        image_b64 = encode_png_b64(image_bgr)
-        per_model: Dict[str, Any] = {}
-        all_words: List[Dict[str, Any]] = []
-        all_lines: List[Dict[str, Any]] = []
-        for model_id, model_url in model_urls.items():
-            try:
-                result = _call_model(session, model_id=model_id, model_url=model_url, image_b64=image_b64, min_score=req.min_score)
-                per_model[model_id] = {
-                    "status": "ok",
-                    "latency_ms": int(result.get("latency_ms") or 0),
-                    "words": list(result.get("words") or []),
-                    "lines": list(result.get("lines") or []),
-                }
-                for item in per_model[model_id]["words"]:
-                    item["source_model"] = model_id
-                for item in per_model[model_id]["lines"]:
-                    item["source_model"] = model_id
-                all_words.extend(per_model[model_id]["words"])
-                all_lines.extend(per_model[model_id]["lines"])
-            except Exception as exc:
-                per_model[model_id] = {"status": "error", "error": str(exc), "words": [], "lines": []}
-
-        height, width = image_bgr.shape[:2]
-        response = OCRResponse(
-            width=width,
-            height=height,
-            words=_merge_level(all_words),
-            lines=_merge_level(all_lines),
-            model_id="ocr-ensemble",
-            backend="fanout",
-            latency_ms=int((time.perf_counter() - t0) * 1000),
-            meta={"models": list(model_urls.keys()), "per_model_status": {key: value["status"] for key, value in per_model.items()}},
-        ).model_dump()
-        if req.return_level == "word":
-            response["lines"] = []
-        elif req.return_level == "line":
-            response["words"] = []
+        if force_debug:
+            req.debug = True
+        response = execute_ocr_fanout(
+            image_bgr=image_bgr,
+            req=req,
+            model_urls=model_urls,
+            drop_mock_backend=drop_mock_backend,
+            session=session,
+        )
         if req.debug or force_debug:
+            per_model = response.get("meta", {}).get("per_model") or {}
             response["debug_artifacts"] = _artifact_bundle(image_bgr, response, per_model)
-            response["meta"]["per_model"] = per_model
         return response
 
     @app.get("/health")
