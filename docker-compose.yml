@@ -205,12 +205,16 @@ services:
       --host 0.0.0.0
       --port 8000
       --trust-remote-code
+      --max-model-len ${GROUNDNEXT_RUNTIME_MAX_MODEL_LEN:-8192}
+      --enforce-eager
       --dtype ${GROUNDNEXT_RUNTIME_DTYPE:-bfloat16}
     environment:
       HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-}
       HF_HOME: /root/.cache/huggingface
       TRANSFORMERS_CACHE: /root/.cache/huggingface
-      NVIDIA_VISIBLE_DEVICES: ${UI_VISION_REAL_VISIBLE_GPUS:-all}
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
+      CUDA_VISIBLE_DEVICES: ${GROUNDNEXT_RUNTIME_VISIBLE_GPU:-all}
+      NVIDIA_VISIBLE_DEVICES: ${GROUNDNEXT_RUNTIME_VISIBLE_GPU:-all}
     ports:
       - "29111:8000"
     volumes:
@@ -225,20 +229,27 @@ services:
 
   aria-ui-runtime:
     profiles: ["ui-vision-real"]
-    image: ${VLLM_RUNTIME_IMAGE:-vllm/vllm-openai:latest}
-    command: >-
-      --model ${ARIA_UI_RUNTIME_MODEL_ID:-Aria-UI/Aria-UI-base}
-      --served-model-name aria-ui
-      --host 0.0.0.0
-      --port 8000
-      --trust-remote-code
-      --tokenizer-mode slow
-      --dtype ${ARIA_UI_RUNTIME_DTYPE:-bfloat16}
+    build:
+      context: .
+      dockerfile: realModels/aria-ui/Dockerfile
+      args:
+        BASE_IMAGE: ${VLLM_RUNTIME_IMAGE:-vllm/vllm-openai:latest}
+    image: ai-ui-runtime-aria-ui:latest
+    pull_policy: never
+    entrypoint: ["python3", "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     environment:
       HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-}
       HF_HOME: /root/.cache/huggingface
       TRANSFORMERS_CACHE: /root/.cache/huggingface
-      NVIDIA_VISIBLE_DEVICES: ${UI_VISION_REAL_VISIBLE_GPUS:-all}
+      MODEL_ID: ${ARIA_UI_RUNTIME_MODEL_ID:-Aria-UI/Aria-UI-base}
+      SERVED_MODEL_NAME: aria-ui
+      MODEL_DTYPE: ${ARIA_UI_RUNTIME_DTYPE:-bfloat16}
+      MAX_TOKENS: "64"
+      IMAGE_MAX_SIZE: "980"
+      SPLIT_IMAGE: "true"
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
+      CUDA_VISIBLE_DEVICES: ${ARIA_UI_RUNTIME_VISIBLE_GPU:-all}
+      NVIDIA_VISIBLE_DEVICES: ${ARIA_UI_RUNTIME_VISIBLE_GPU:-all}
     ports:
       - "29112:8000"
     volumes:
@@ -260,12 +271,15 @@ services:
       --host 0.0.0.0
       --port 8000
       --trust-remote-code
+      --max-model-len ${PHI_GROUND_RUNTIME_MAX_MODEL_LEN:-8192}
       --dtype ${PHI_GROUND_RUNTIME_DTYPE:-bfloat16}
     environment:
       HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-}
       HF_HOME: /root/.cache/huggingface
       TRANSFORMERS_CACHE: /root/.cache/huggingface
-      NVIDIA_VISIBLE_DEVICES: ${UI_VISION_REAL_VISIBLE_GPUS:-all}
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
+      CUDA_VISIBLE_DEVICES: ${PHI_GROUND_RUNTIME_VISIBLE_GPU:-all}
+      NVIDIA_VISIBLE_DEVICES: ${PHI_GROUND_RUNTIME_VISIBLE_GPU:-all}
     ports:
       - "29113:8000"
     volumes:

@@ -11,6 +11,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from modelService.app.providers import HTTPProxyProvider, ProviderError, build_provider
+from ui_vision_common.image_tools import encode_png_b64
 
 
 class _ProxyHandler(BaseHTTPRequestHandler):
@@ -220,6 +221,150 @@ class HTTPProxyProviderTest(unittest.TestCase):
         self.assertEqual(result["lines"][0]["text"], "Compose")
         self.assertEqual(result["lines"][1]["poly"][0], [100.0, 50.0])
         self.assertEqual(result["meta"]["page_count"], 1)
+
+    def test_groundnext_runtime_provider_maps_tool_call_to_candidates(self):
+        server, thread = self._run_server(
+            {
+                "/v1/models": {"data": [{"id": "groundnext"}]},
+                "/v1/chat/completions": {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": '<tool_call>{"name":"computer_use","arguments":{"action":"left_click","coordinate":[650,145]}}</tool_call>'
+                            }
+                        }
+                    ]
+                },
+            }
+        )
+        payload = {
+            "instruction": "click the Sign in button in the top right",
+            "screenshot_b64": encode_png_b64(np.full((400, 800, 3), 255, dtype=np.uint8)),
+            "candidates": [
+                {"id": "C1", "box": [600, 120, 720, 170], "text": "Sign in", "allowed_actions": ["click"]},
+                {"id": "C2", "box": [420, 320, 720, 370], "text": "Continue", "allowed_actions": ["click"]},
+            ],
+            "top_k": 2,
+        }
+        try:
+            provider = build_provider("groundnext", "grounding", "groundnext_runtime", f"http://127.0.0.1:{server.server_port}")
+            result = provider.run_grounding(payload)
+        finally:
+            server.shutdown()
+            thread.join(timeout=2.0)
+            server.server_close()
+
+        self.assertEqual(result["predictions"][0]["candidate_id"], "C1")
+        self.assertEqual(result["predictions"][0]["raw_point"], [650, 145])
+        self.assertEqual(result["meta"]["served_model_name"], "groundnext")
+
+    def test_aria_ui_runtime_provider_maps_relative_point_to_candidates(self):
+        server, thread = self._run_server(
+            {
+                "/v1/models": {"data": [{"id": "aria-ui"}]},
+                "/v1/chat/completions": {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "```python\n[650, 145]\n```<|im_end|>"
+                            }
+                        }
+                    ]
+                },
+            }
+        )
+        payload = {
+            "instruction": "click the Sign in button in the top right",
+            "screenshot_b64": encode_png_b64(np.full((1000, 1000, 3), 255, dtype=np.uint8)),
+            "candidates": [
+                {"id": "C1", "box": [600, 120, 720, 170], "text": "Sign in", "allowed_actions": ["click"]},
+                {"id": "C2", "box": [420, 320, 720, 370], "text": "Continue", "allowed_actions": ["click"]},
+            ],
+            "top_k": 2,
+        }
+        try:
+            provider = build_provider("aria-ui", "grounding", "aria_ui_runtime", f"http://127.0.0.1:{server.server_port}")
+            result = provider.run_grounding(payload)
+        finally:
+            server.shutdown()
+            thread.join(timeout=2.0)
+            server.server_close()
+
+        self.assertEqual(result["predictions"][0]["candidate_id"], "C1")
+        self.assertEqual(result["predictions"][0]["raw_point"], [650, 145])
+        self.assertEqual(result["meta"]["relative_point"], [650.0, 145.0])
+
+    def test_phi_ground_runtime_provider_maps_relative_box_to_candidates(self):
+        server, thread = self._run_server(
+            {
+                "/v1/models": {"data": [{"id": "phi-ground"}]},
+                "/v1/chat/completions": {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "[595, 179, 714, 253]<|end|>"
+                            }
+                        }
+                    ]
+                },
+            }
+        )
+        payload = {
+            "instruction": "click the Sign in button in the top right",
+            "screenshot_b64": encode_png_b64(np.full((672, 1008, 3), 255, dtype=np.uint8)),
+            "candidates": [
+                {"id": "C1", "box": [600, 120, 720, 170], "text": "Sign in", "allowed_actions": ["click"]},
+                {"id": "C2", "box": [420, 320, 720, 370], "text": "Continue", "allowed_actions": ["click"]},
+            ],
+            "top_k": 2,
+        }
+        try:
+            provider = build_provider("phi-ground", "grounding", "phi_ground_runtime", f"http://127.0.0.1:{server.server_port}")
+            result = provider.run_grounding(payload)
+        finally:
+            server.shutdown()
+            thread.join(timeout=2.0)
+            server.server_close()
+
+        self.assertEqual(result["predictions"][0]["candidate_id"], "C1")
+        self.assertEqual(result["predictions"][0]["raw_box"], [600, 120, 720, 170])
+        self.assertEqual(result["meta"]["relative_box"], [595.0, 179.0, 714.0, 253.0])
+
+    def test_phi_ground_runtime_provider_accepts_point_output(self):
+        server, thread = self._run_server(
+            {
+                "/v1/models": {"data": [{"id": "phi-ground"}]},
+                "/v1/chat/completions": {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "<point>650,145</point>"
+                            }
+                        }
+                    ]
+                },
+            }
+        )
+        payload = {
+            "instruction": "click the Sign in button in the top right",
+            "screenshot_b64": encode_png_b64(np.full((400, 800, 3), 255, dtype=np.uint8)),
+            "candidates": [
+                {"id": "C1", "box": [600, 120, 720, 170], "text": "Sign in", "allowed_actions": ["click"]},
+                {"id": "C2", "box": [420, 320, 720, 370], "text": "Continue", "allowed_actions": ["click"]},
+            ],
+            "top_k": 2,
+        }
+        try:
+            provider = build_provider("phi-ground", "grounding", "phi_ground_runtime", f"http://127.0.0.1:{server.server_port}")
+            result = provider.run_grounding(payload)
+        finally:
+            server.shutdown()
+            thread.join(timeout=2.0)
+            server.server_close()
+
+        self.assertEqual(result["predictions"][0]["candidate_id"], "C1")
+        self.assertEqual(result["predictions"][0]["raw_point"], [650, 145])
+        self.assertEqual(result["meta"]["raw_point"], [650, 145])
 
 
 if __name__ == "__main__":
