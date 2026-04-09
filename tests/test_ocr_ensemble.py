@@ -1,3 +1,4 @@
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -7,7 +8,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
 
 from ocrEnsemble.app.main import execute_ocr_fanout
-from tests.support import http_post_json, running_compose_services, wait_for_json
+from tests.support import (
+    http_post_json,
+    run_uvicorn_app,
+    running_compose_services,
+    wait_for_json,
+)
 from ui_vision_common.schemas import OCRRequest
 
 
@@ -153,6 +159,41 @@ class OCREnsembleDropMockTest(unittest.TestCase):
         self.assertNotIn("Sign", merged_texts)
         self.assertNotIn("Browser", merged_texts)
         self.assertNotIn("Continue", merged_texts)
+
+
+class OCREnsembleUvicornTest(unittest.TestCase):
+    """Integration-flavor test that brings the ensemble up under uvicorn and
+    speaks real HTTP to it. Catches regressions in the FastAPI route wiring,
+    JSON serialization, and subprocess startup — things the pure
+    ``execute_ocr_fanout`` tests can't see.
+    """
+
+    def test_selftest_via_uvicorn_subprocess(self):
+        env = {
+            "OCR_ENSEMBLE_MODEL_URLS": json.dumps(
+                {
+                    "ppocr": "mock://ppocr",
+                    "omniparser": "mock://omniparser",
+                    "paddleocr-vl": "mock://paddleocr-vl",
+                    "surya": "mock://surya",
+                }
+            ),
+            "OCR_ENSEMBLE_DROP_MOCK_BACKEND": "1",
+        }
+        with run_uvicorn_app(module_name="ocrEnsemble.app.main", env=env) as base_url:
+            status, body = http_post_json(base_url + "/admin/selftest", {})
+            self.assertEqual(status, 200)
+            meta = body["meta"]
+            self.assertTrue(meta["drop_mock_backend"])
+            self.assertEqual(
+                sorted(meta["dropped_mock_models"]),
+                ["omniparser", "paddleocr-vl", "ppocr", "surya"],
+            )
+            self.assertEqual(body["words"], [])
+            self.assertEqual(body["lines"], [])
+            # debug_artifacts come from the FastAPI wrapper's _artifact_bundle
+            # call — this is the only path that exercises it under real HTTP.
+            self.assertIn("artifact_dir", body["debug_artifacts"])
 
 
 class OCREnsembleComposeTest(unittest.TestCase):
